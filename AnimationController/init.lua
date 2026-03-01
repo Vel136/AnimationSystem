@@ -4,23 +4,35 @@
 -- Owns: LayerManager, ExclusiveGroupManager, StateMachine, all TrackWrappers.
 -- No external system may directly manipulate AnimationTracks.
 -- All animation operations are routed through this class.
+--
+-- ENVIRONMENT ROLES:
+--   Owning Client  — plays animations locally, sends intents to server.
+--   Server         — manages state machine authority, relays intents to other clients.
+--                    Never loads or plays AnimationTracks.
+--   Non-owning Client — receives relayed intents from server, plays animations locally
+--                       to visually reconstruct the character's state on their screen.
+--
+-- AnimationTrack loading and playback only ever happens on clients.
+-- The server runs the state machine and replication relay only.
 
 local RunService = game:GetService("RunService")
 
-local Types               = require(script.Types)
-local TrackWrapper        = require(script.TrackWrapper)
-local LayerManager        = require(script.LayerManager)
+local Types                 = require(script.Types)
+local TrackWrapper          = require(script.TrackWrapper)
+local LayerManager          = require(script.LayerManager)
 local ExclusiveGroupManager = require(script.ExclusiveGroupManager)
-local StateMachine        = require(script.StateMachine)
-local ConflictResolver    = require(script.ConflictResolver)
-local AnimationRegistry   = require(script.AnimationRegistry)
-local ReplicationBridge   = require(script.ReplicationBridge)
+local StateMachine          = require(script.StateMachine)
+local ConflictResolver      = require(script.ConflictResolver)
+local AnimationRegistry     = require(script.AnimationRegistry)
+local ReplicationBridge     = require(script.ReplicationBridge)
 
 type AnimationConfig    = Types.AnimationConfig
 type LayerProfile       = Types.LayerProfile
 type StateDefinition    = Types.StateDefinition
 type AnimationDirective = Types.AnimationDirective
 type PlayRequest        = Types.PlayRequest
+
+local IS_SERVER = RunService:IsServer()
 
 -- ── Pool Constants ─────────────────────────────────────────────────────────
 
@@ -30,7 +42,8 @@ local MAX_POOL_SIZE_PER_CONFIG = 2
 
 export type ControllerConfig = {
 	CharacterId    : string,
-	Animator       : Animator,
+	Animator       : Animator?,   -- nil on the server; server never loads tracks
+	IsOwningClient : boolean,     -- true only on the client that owns this character
 	LayerProfiles  : { LayerProfile },
 	States         : { StateDefinition },
 	InitialState   : string,
@@ -46,39 +59,40 @@ AnimationController.__index = AnimationController
 
 function AnimationController.new(cfg: ControllerConfig): any
 	local registry = AnimationRegistry.GetInstance()
-	assert(registry:IsInitialized(), "[AnimationController] AnimationRegistry must be initialized before creating controllers")
+	assert(registry:IsInitialized(),
+		"[AnimationController] AnimationRegistry must be initialized before creating controllers")
+
+	-- Server should never receive a real Animator — guard against misconfiguration.
+	if IS_SERVER and cfg.Animator ~= nil then
+		warn("[AnimationController] Animator was passed on the server. It will be ignored. " ..
+			"The server does not load or play AnimationTracks.")
+	end
 
 	local self = setmetatable({
 		CharacterId  = cfg.CharacterId,
-		Animator     = cfg.Animator,
+		-- Only store the Animator on clients. Server gets nil.
+		Animator     = IS_SERVER and nil or cfg.Animator,
 		IsDestroyed  = false,
 
-		-- Subsystems (created below)
 		LayerManager = nil,
 		GroupManager = nil,
 		StateMachine = nil,
 
-		-- Track management
-		ActiveWrappers = {} :: { [string]: any }, -- keyed by Config.Name
+		ActiveWrappers = {} :: { [string]: any },
 		PendingQueue   = {} :: { PlayRequest },
-		_wrapperPool   = {} :: { [string]: { any } }, -- keyed by Config.Name
+		_wrapperPool   = {} :: { [string]: { any } },
 
-		-- Replication
 		_replication   = nil,
-
-		-- Frame connections
 		_frameConn     = nil :: RBXScriptConnection?,
 	}, AnimationController)
 
-	-- Build LayerManager
+	-- Build subsystems
 	self.LayerManager = LayerManager.new(cfg.LayerProfiles)
 
-	-- Build ExclusiveGroupManager with pending-ready callback
 	self.GroupManager = ExclusiveGroupManager.new(function(groupName: string, wrapper: any)
 		self:_OnPendingReady(groupName, wrapper)
 	end)
 
-	-- Build StateMachine with state-change callback
 	self.StateMachine = StateMachine.new(
 		cfg.States,
 		cfg.InitialState,
@@ -88,19 +102,20 @@ function AnimationController.new(cfg: ControllerConfig): any
 		end
 	)
 
-	-- Build ReplicationBridge
 	self._replication = ReplicationBridge.new(
 		cfg.CharacterId,
 		cfg.IntentRemote,
 		cfg.SnapshotRemote,
+		cfg.IsOwningClient,
 		function(intent: Types.AnimationIntent)
 			self:_OnIntentReceived(intent)
 		end
 	)
 
-	-- Bind per-frame update
-	local isServer = RunService:IsServer()
-	local updateEvent = isServer and RunService.Heartbeat or RunService.RenderStepped
+	-- Bind per-frame update.
+	-- Server uses Heartbeat. Clients use RenderStepped so the tick stays
+	-- in sync with the render frame where animations are actually visible.
+	local updateEvent = IS_SERVER and RunService.Heartbeat or RunService.RenderStepped
 	self._frameConn = updateEvent:Connect(function(dt: number)
 		self:_Tick(dt)
 	end)
@@ -113,20 +128,20 @@ end
 function AnimationController:_Tick(dt: number)
 	if self.IsDestroyed then return end
 
-	-- Step 1: StateMachine evaluates pending transition requests
+	-- Step 1: StateMachine evaluates pending transitions
 	self.StateMachine:Tick()
 
-	-- Step 2: LayerManager recomputes blended weights for layers whose target changed
+	-- Step 2: LayerManager smoothly interpolates layer weights
 	self.LayerManager:UpdateWeights(dt)
 
-	-- Step 3: Push computed weights to all active TrackWrappers
+	-- Step 3: Push computed weights down to all active TrackWrappers
 	self:_PushWeights()
 
-	-- Step 4: Flush ReplicationBridge intent queue
+	-- Step 4: Flush ReplicationBridge
 	local activeGroupAnims = self:_BuildActiveGroupAnimMap()
 	self._replication:Flush(dt, self.StateMachine:GetCurrentStateName(), activeGroupAnims)
 
-	-- Step 5: Process pending play requests (queued mid-frame)
+	-- Step 5: Process play requests queued mid-frame
 	self:_FlushPendingQueue()
 end
 
@@ -143,7 +158,6 @@ function AnimationController:_PushWeights()
 		)
 		wrapper:_SetEffectiveWeight(finalWeight)
 
-		-- Remove fully stopped, fully-faded wrappers
 		if not wrapper.IsPlaying and not wrapper.IsFading and wrapper.EffectiveWeight == 0 then
 			table.insert(toRemove, name)
 		end
@@ -162,7 +176,6 @@ function AnimationController:_RetireWrapper(configName: string)
 
 	self.LayerManager:UnregisterTrack(wrapper.Config.Layer, wrapper)
 
-	-- Return to pool if pool has capacity
 	if not self._wrapperPool[configName] then
 		self._wrapperPool[configName] = {}
 	end
@@ -177,7 +190,7 @@ function AnimationController:_RetireWrapper(configName: string)
 	self.ActiveWrappers[configName] = nil
 end
 
--- ── Wrapper Acquisition (with Pooling) ───────────────────────────────────
+-- ── Wrapper Acquisition ───────────────────────────────────────────────────
 
 function AnimationController:_AcquireWrapper(config: AnimationConfig): any
 	-- Check pool first
@@ -188,31 +201,32 @@ function AnimationController:_AcquireWrapper(config: AnimationConfig): any
 		return wrapper
 	end
 
-	-- Load a fresh AnimationTrack
+	-- On the server, create a wrapper with no real track.
+	-- The wrapper still maintains bookkeeping for group/state logic.
+	if IS_SERVER then
+		return TrackWrapper.new(config, nil)
+	end
+
+	-- On the client, load a real AnimationTrack.
+	assert(self.Animator, "[AnimationController] Animator is nil on client — cannot load track")
 	local anim = Instance.new("Animation")
 	anim.AnimationId = config.AssetId
 	local track = self.Animator:LoadAnimation(anim)
-	anim:Destroy() -- Roblox keeps the track alive independently
+	anim:Destroy()
 
 	return TrackWrapper.new(config, track)
 end
 
 -- ── Public Play API ───────────────────────────────────────────────────────
 
--- Primary entry point for external systems.
--- Play requests arriving mid-frame are queued and processed at step 5 of the next tick.
--- (Exception: requests explicitly marked as immediate are processed inline — not in this impl;
---  external callers use the standard path and the pipeline handles timing.)
 function AnimationController:Play(animationName: string)
 	assert(not self.IsDestroyed, "[AnimationController] Cannot play on a destroyed controller")
-
 	table.insert(self.PendingQueue, {
 		ConfigName  = animationName,
 		RequestTime = os.clock(),
 	})
 end
 
--- Convenience: play all animations with a given tag
 function AnimationController:PlayTag(tag: string)
 	local registry = AnimationRegistry.GetInstance()
 	for _, cfg in registry:GetByTag(tag) do
@@ -229,7 +243,9 @@ function AnimationController:Stop(animationName: string, immediate: boolean?)
 	if wrapper.Config.Group then
 		self.GroupManager:ClearActive(wrapper.Config.Group)
 	end
-	self._replication:QueueIntent(animationName, "STOP", self.StateMachine:GetCurrentStateName())
+	if not IS_SERVER and self._replication._isOwningClient then
+		self._replication:QueueIntent(animationName, "STOP", self.StateMachine:GetCurrentStateName())
+	end
 end
 
 function AnimationController:StopGroup(groupName: string, immediate: boolean?)
@@ -240,14 +256,12 @@ function AnimationController:StopGroup(groupName: string, immediate: boolean?)
 	end
 end
 
--- ── Pending Queue Flush — O(Q) ────────────────────────────────────────────
+-- ── Pending Queue Flush ────────────────────────────────────────────────────
 
 function AnimationController:_FlushPendingQueue()
 	if #self.PendingQueue == 0 then return end
-
 	local queue = self.PendingQueue
 	self.PendingQueue = {}
-
 	for _, request in queue do
 		self:_ExecutePlayRequest(request.ConfigName)
 	end
@@ -270,43 +284,34 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 		return
 	end
 
-	-- If already playing this exact animation, do nothing (idempotent)
 	local existing = self.ActiveWrappers[configName]
 	if existing and existing.IsPlaying then return end
 
-	-- ── Group conflict evaluation ─────────────────────────────────────────
+	-- ── Grouped path ──────────────────────────────────────────────────────
 	if config.Group then
 		self.GroupManager:EnsureGroup(config.Group)
 
-		-- Build the incoming wrapper ahead of evaluation so we can pass it to group manager
 		local incomingWrapper = self:_AcquireWrapper(config)
-
 		local result = self.GroupManager:EvaluatePlayRequest(config.Group, incomingWrapper)
 
 		if result.Verdict == "REJECT" then
-			-- Discard the wrapper we just acquired
 			incomingWrapper:_Destroy()
 			return
 		elseif result.Verdict == "DEFER" then
-			-- Wrapper is now held as PendingWrapper in the group — do not play yet.
-			-- The group manager will call _OnPendingReady when it's eligible.
 			return
 		elseif result.Verdict == "ALLOW" then
-			-- Fade out the displaced active wrapper if any
 			if result.WrapperToStop then
 				result.WrapperToStop:_Stop(false)
 			end
 			if result.PendingEvicted then
 				result.PendingEvicted:_Destroy()
 			end
-			-- Activate the incoming wrapper
 			self:_ActivateWrapper(incomingWrapper, config, layerRecord)
 			return
 		end
 	end
 
-	-- ── Non-grouped: run ConflictResolver against same-layer incumbents ───
-	-- Find any active wrapper on the same layer
+	-- ── Non-grouped path ──────────────────────────────────────────────────
 	local incumbentWrapper: any = nil
 	for _, wrapper in self.ActiveWrappers do
 		if wrapper.Config.Layer == config.Layer and wrapper ~= existing then
@@ -322,7 +327,7 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 			config,
 			layerRecord.Order,
 			incumbentWrapper.Config,
-			layerRecord.Order, -- same layer by definition in this branch
+			layerRecord.Order,
 			incumbentWrapper.StartTimestamp
 		)
 	else
@@ -333,15 +338,14 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 		local wrapper = self:_AcquireWrapper(config)
 		self:_ActivateWrapper(wrapper, config, layerRecord)
 	end
-	-- DEFER is not meaningful without group context; REJECT means do nothing.
 end
 
--- Activates a wrapper: registers it, plays it, notifies replication.
+-- ── Wrapper Activation ────────────────────────────────────────────────────
+
 function AnimationController:_ActivateWrapper(wrapper: any, config: AnimationConfig, layerRecord: any)
 	self.ActiveWrappers[config.Name] = wrapper
 	self.LayerManager:RegisterTrack(config.Layer, wrapper)
 
-	-- Wire completion for non-looped tracks to notify group manager
 	if not config.Looped and config.Group then
 		wrapper.CompletedSignal:Connect(function()
 			self.GroupManager:OnActiveCompleted(config.Group :: string)
@@ -349,19 +353,24 @@ function AnimationController:_ActivateWrapper(wrapper: any, config: AnimationCon
 	end
 
 	wrapper:_Play()
-	self._replication:QueueIntent(config.Name, "PLAY", self.StateMachine:GetCurrentStateName())
+
+	-- Only the owning client queues intents upward to the server.
+	-- Non-owning clients are reconstructing state from a received intent,
+	-- so sending another intent would create a replication loop.
+	-- The server never sends intents — it only relays them.
+	if not IS_SERVER and self._replication._isOwningClient then
+		self._replication:QueueIntent(config.Name, "PLAY", self.StateMachine:GetCurrentStateName())
+	end
 end
 
 -- ── Pending Ready Callback ────────────────────────────────────────────────
 
--- Called by ExclusiveGroupManager when a deferred request becomes eligible.
 function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
 	if self.IsDestroyed then return end
 	local config      = wrapper.Config
 	local layerRecord = self.LayerManager:GetLayer(config.Layer)
 	if not layerRecord then return end
 
-	-- Re-run group evaluation to confirm no new conflict arose during the wait
 	local result = self.GroupManager:EvaluatePlayRequest(groupName, wrapper)
 	if result.Verdict == "ALLOW" then
 		if result.WrapperToStop then
@@ -376,13 +385,10 @@ end
 -- ── State Machine Callback ────────────────────────────────────────────────
 
 function AnimationController:_OnStateChange(exitState: StateDefinition, enterState: StateDefinition)
-	-- Dispatch ExitActions first (in order) before any entry begins
 	for _, directive in exitState.ExitActions do
 		self:_DispatchDirective(directive)
 	end
 
-	-- Compute diff-driven layer weight changes (minimum set of changes)
-	-- Build sets for quick lookup
 	local enterActive   : { [string]: boolean } = {}
 	local enterSuppress : { [string]: boolean } = {}
 	for _, name in enterState.ActiveLayers   do enterActive[name]   = true end
@@ -393,21 +399,18 @@ function AnimationController:_OnStateChange(exitState: StateDefinition, enterSta
 	for _, name in exitState.ActiveLayers   do exitActive[name]   = true end
 	for _, name in exitState.SuppressLayers do exitSuppress[name] = true end
 
-	-- Activate layers that are active in new state but were suppressed/inactive before
 	for name in enterActive do
 		if not exitActive[name] then
 			self.LayerManager:SetLayerToBase(name)
 		end
 	end
 
-	-- Suppress layers that should be suppressed in new state but weren't before
 	for name in enterSuppress do
 		if not exitSuppress[name] then
 			self.LayerManager:SuppressLayer(name)
 		end
 	end
 
-	-- Dispatch EntryActions
 	for _, directive in enterState.EntryActions do
 		self:_DispatchDirective(directive)
 	end
@@ -429,8 +432,9 @@ end
 
 -- ── Replication Intent Receiver ───────────────────────────────────────────
 
+-- Called on non-owning clients when the server relays an intent.
+-- Reconstructs animation state by running the full local pipeline.
 function AnimationController:_OnIntentReceived(intent: Types.AnimationIntent)
-	-- Non-owning clients reconstruct state from intent stream
 	if intent.Action == "PLAY" then
 		self:Play(intent.AnimationName)
 	elseif intent.Action == "STOP" then
@@ -444,7 +448,7 @@ function AnimationController:RequestStateTransition(stateName: string, priority:
 	self.StateMachine:RequestTransition(stateName, priority or 0)
 end
 
--- ── Helper: active group anim map for replication snapshots ───────────────
+-- ── Helper ─────────────────────────────────────────────────────────────────
 
 function AnimationController:_BuildActiveGroupAnimMap(): { [string]: string }
 	local map = {}
@@ -456,35 +460,30 @@ function AnimationController:_BuildActiveGroupAnimMap(): { [string]: string }
 	return map
 end
 
--- ── Attach DebugInspector ─────────────────────────────────────────────────
+-- ── Debug Inspector ───────────────────────────────────────────────────────
 
 function AnimationController:AttachInspector(): any
-	local DebugInspector = require(script.Parent.DebugInspector)
+	local DebugInspector = require(script.DebugInspector)
 	return DebugInspector.new(self)
 end
 
 -- ── Destruction ───────────────────────────────────────────────────────────
 
--- Synchronous. Stops all active tracks, releases all wrappers,
--- disconnects all signals, deregisters from ReplicationBridge.
 function AnimationController:Destroy()
 	if self.IsDestroyed then return end
 	self.IsDestroyed = true
 
-	-- Disconnect frame update
 	if self._frameConn then
 		self._frameConn:Disconnect()
 		self._frameConn = nil
 	end
 
-	-- Stop and destroy all active wrappers (immediate, no fade)
 	for name, wrapper in self.ActiveWrappers do
 		wrapper:_Stop(true)
 		wrapper:_Destroy()
 	end
 	table.clear(self.ActiveWrappers)
 
-	-- Destroy all pooled wrappers
 	for _, pool in self._wrapperPool do
 		for _, wrapper in pool do
 			wrapper:_Destroy()
@@ -492,11 +491,8 @@ function AnimationController:Destroy()
 	end
 	table.clear(self._wrapperPool)
 
-	-- Destroy subsystems
 	self.GroupManager:Destroy()
 	self._replication:Destroy()
-
-	-- Clear pending queue
 	table.clear(self.PendingQueue)
 end
 
