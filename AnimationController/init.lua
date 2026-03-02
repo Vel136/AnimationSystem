@@ -410,7 +410,14 @@ function AnimationController:_OnStateChange(exitState: StateDefinition, enterSta
 			self.LayerManager:SuppressLayer(name)
 		end
 	end
-
+	
+	-- Restore layers that were suppressed by the exiting state but aren't suppressed/active in the entering state
+	for name in exitSuppress do
+		if not enterSuppress[name] and not enterActive[name] then
+			self.LayerManager:SetLayerToBase(name)
+		end
+	end
+	
 	for _, directive in enterState.EntryActions do
 		self:_DispatchDirective(directive)
 	end

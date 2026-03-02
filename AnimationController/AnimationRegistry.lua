@@ -100,8 +100,7 @@ function AnimationRegistry:Init(configs: { any })
 			string.format("[AnimationRegistry] Duplicate animation name '%s' at index %d", cfg.Name, i)
 		)
 
-		local frozen: AnimationConfig = table.freeze(table.clone(cfg)) :: any
-		frozen = table.freeze({
+		local frozen: AnimationConfig = table.freeze({
 			Name         = cfg.Name,
 			AssetId      = cfg.AssetId,
 			Layer        = cfg.Layer,

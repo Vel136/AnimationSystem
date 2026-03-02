@@ -160,6 +160,13 @@ function ExclusiveGroupManager:Destroy()
 			task.cancel(thread)
 		end
 	end
+	-- destroy any pending wrappers that never got promoted
+	for _, record in self._groups do
+		if record.PendingWrapper then
+			record.PendingWrapper:_Destroy()
+			record.PendingWrapper = nil
+		end
+	end
 	table.clear(self._pendingTimers)
 	table.clear(self._groups)
 end

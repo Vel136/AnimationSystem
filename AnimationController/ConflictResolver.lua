@@ -77,20 +77,7 @@ function ConflictResolver.Resolve(input: ResolverInput): ConflictVerdict
 		return "REJECT"
 	end
 
-	-- ── Phase 4: Timestamp ────────────────────────────────────────────────
-	-- Lower StartTimestamp = started earlier = incumbent wins.
-	-- Incoming always has a larger timestamp (recorded at execution time, not request time).
-	-- Ties are treated as REJECT to preserve the incumbent.
-	-- (In practice, os.clock() monotonic resolution makes exact ties astronomically rare.)
-	local incomingTs = os.clock() -- Incoming hasn't played yet; it is definitionally newer
-	local activeTs   = input.ActiveTimestamp or 0
-
-	if incomingTs <= activeTs then
-		-- Incumbent is newer or equal — reject incoming (conservative correct choice)
-		return "REJECT"
-	end
-
-	-- Incoming is newer — incumbent wins by timestamp; REJECT incoming
+	-- Phase 4: Timestamp — incumbent always wins ties
 	return "REJECT"
 end
 
