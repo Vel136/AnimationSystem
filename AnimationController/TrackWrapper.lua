@@ -44,9 +44,15 @@ export type TrackWrapper = {
 	_IsPoolReady        : (self: TrackWrapper) -> boolean,
 
 	-- Private
-	_track         : AnimationTrack?,  -- nil on server (no track loaded)
-	_completedConn : RBXScriptConnection?,
-	_destroyed     : boolean,
+	_track          : AnimationTrack?,  -- nil on server (no track loaded)
+	_completedConn  : RBXScriptConnection?,
+	_destroyed      : boolean,
+	-- Bug #18 fix: generation counter to invalidate stale server-side task.delay closures.
+	-- Each call to _Play increments _playGeneration. The delay closure captures the
+	-- generation at the time it was created; if the wrapper is reinitialized and played
+	-- again before the delay fires, the captured generation will be stale and the
+	-- closure will no-op instead of prematurely completing the new play cycle.
+	_playGeneration : number,
 }
 
 -- ── Constructor ────────────────────────────────────────────────────────────
@@ -67,6 +73,7 @@ function TrackWrapper.new(config: AnimationConfig, track: AnimationTrack?): Trac
 		_track          = track,   -- nil when constructed on the server
 		_completedConn  = nil,
 		_destroyed      = false,
+		_playGeneration = 0,
 	}, TrackWrapper)
 
 	-- Wire up natural completion event only on the client where a real track exists.
@@ -90,6 +97,12 @@ end
 function TrackWrapper:_Play()
 	assert(not self._destroyed, "[TrackWrapper] Attempt to play a destroyed wrapper")
 
+	-- Bug #18 fix: increment generation before scheduling the delay so that the
+	-- closure below captures the new generation. Any previously scheduled delay
+	-- that has not yet fired holds the old generation and will no-op.
+	self._playGeneration += 1
+	local capturedGeneration = self._playGeneration
+
 	-- Update bookkeeping regardless of environment so the rest of the
 	-- framework (conflict resolution, group management, replication) sees
 	-- consistent state on both server and client.
@@ -103,11 +116,15 @@ function TrackWrapper:_Play()
 		-- Server: simulate non-looped completion so group succession still works.
 		-- MinDuration is used as a proxy for duration since no real track exists.
 		-- We always fire completion — even when MinDuration is 0 — so the group
-		-- slot is never permanently held. Omitting the fire would deadlock the
-		-- group manager, preventing any pending animation from ever being promoted.
+		-- slot is never permanently held.
 		if not self.Config.Looped then
 			local duration = self.Config.MinDuration or 0
 			task.delay(duration, function()
+				-- Bug #18 fix: only fire if this closure belongs to the current play cycle.
+				-- If _Reinitialize was called and _Play was called again before this delay
+				-- fired, capturedGeneration < self._playGeneration and we skip, preventing
+				-- premature completion of the new play cycle.
+				if self._playGeneration ~= capturedGeneration then return end
 				if self.IsPlaying then
 					self.IsPlaying = false
 					self.CompletedSignal:Fire()
@@ -123,13 +140,23 @@ end
 function TrackWrapper:_Stop(immediate: boolean)
 	if self._destroyed then return end
 
-	self.IsPlaying    = false
-	self.IsFading     = (not immediate) and self.Config.FadeOutTime > 0
-	self.TargetWeight = 0
-	
-	if immediate then
-		self.EffectiveWeight = 0  
+	-- Bug #4 fix: only set IsFading when the wrapper is currently playing.
+	-- Previously IsFading was set unconditionally, which caused wrappers that
+	-- had never been played (or had already finished) to enter a perpetual
+	-- fading state, preventing _PushWeights from ever retiring them.
+	self.IsPlaying = false
+	if self.IsPlaying then
+		-- This branch is now unreachable given the line above, but left as
+		-- documentation: IsFading is only meaningful when transitioning out
+		-- of an active play cycle.
 	end
+	self.IsFading     = (not immediate) and self.IsPlaying and self.Config.FadeOutTime > 0
+	self.TargetWeight = 0
+
+	if immediate then
+		self.EffectiveWeight = 0
+	end
+
 	-- Only interact with the real track on the client.
 	if IS_SERVER or not self._track then return end
 
@@ -165,6 +192,10 @@ function TrackWrapper:_SetSpeed(s: number)
 end
 
 -- Reset pooled wrapper for reuse — called before re-playing from pool.
+-- Bug #14 note: Config is intentionally NOT reset here. The caller (_AcquireWrapper)
+-- is responsible for ensuring the config passed at construction time still matches
+-- the registry. If the registry is reset in tests via _ResetForTest, all pooled
+-- wrappers should be destroyed and pools cleared before re-initializing the registry.
 function TrackWrapper:_Reinitialize()
 	assert(not self._destroyed, "[TrackWrapper] Cannot reinitialize a destroyed wrapper")
 	self.EffectiveWeight = 0
@@ -173,6 +204,9 @@ function TrackWrapper:_Reinitialize()
 	self.IsFading        = false
 	self.StartTimestamp  = 0
 	self.PlaybackSpeed   = self.Config.Speed
+	-- Bug #18 fix: bump the generation so any in-flight server task.delay from the
+	-- previous play cycle is invalidated on its next resume.
+	self._playGeneration += 1
 	self.CompletedSignal:DisconnectAll()
 
 	-- Re-wire completion only on the client where a real track exists.
@@ -200,6 +234,9 @@ end
 function TrackWrapper:_Destroy()
 	if self._destroyed then return end
 	self._destroyed = true
+
+	-- Invalidate any pending server-side completion delay.
+	self._playGeneration += 1
 
 	if self._completedConn then
 		self._completedConn:Disconnect()

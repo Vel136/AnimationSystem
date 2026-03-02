@@ -8,6 +8,13 @@
 local Types = require(script.Parent.Types)
 type LayerProfile = Types.LayerProfile
 
+-- ── Constants ──────────────────────────────────────────────────────────────
+
+-- Bug #21 fix: floating-point equality against TargetWeight is unreliable after lerp.
+-- Use an epsilon threshold instead so the early-out triggers correctly once the
+-- weight is effectively settled, and weight pushes are not sent every frame forever.
+local WEIGHT_EPSILON = 1e-6
+
 -- ── Layer Runtime Record ───────────────────────────────────────────────────
 
 type LayerRecord = {
@@ -106,17 +113,26 @@ end
 -- Called once per tick by AnimationController.
 -- Advances CurrentWeight toward TargetWeight at the layer's configured rate.
 -- Returns true if any layer changed (indicating weight-push step needed).
+--
+-- Bug #21 fix: replaced ~= comparison with an epsilon check so that weights
+-- that have lerped to within WEIGHT_EPSILON of their target are snapped and
+-- treated as settled. Without this, floating-point residuals (e.g. 0.9999999)
+-- keep anyChanged = true every frame, defeating the early-out optimisation.
 function LayerManager:UpdateWeights(dt: number): boolean
 	local anyChanged = false
 	for _, layer in self._layers do
-		if layer.CurrentWeight ~= layer.TargetWeight then
-			local delta = layer.TargetWeight - layer.CurrentWeight
-			local step  = layer.WeightLerpRate * dt
+		local delta = layer.TargetWeight - layer.CurrentWeight
+		if math.abs(delta) > WEIGHT_EPSILON then
+			local step = layer.WeightLerpRate * dt
 			if math.abs(delta) <= step then
 				layer.CurrentWeight = layer.TargetWeight
 			else
 				layer.CurrentWeight = layer.CurrentWeight + math.sign(delta) * step
 			end
+			anyChanged = true
+		elseif layer.CurrentWeight ~= layer.TargetWeight then
+			-- Snap the residual to eliminate the float drift permanently.
+			layer.CurrentWeight = layer.TargetWeight
 			anyChanged = true
 		end
 	end
@@ -162,12 +178,12 @@ function LayerManager:GetSnapshot(): { { [string]: any } }
 	local out = {}
 	for _, layer in self._layers do
 		table.insert(out, {
-			Name            = layer.Name,
-			Order           = layer.Order,
-			CurrentWeight   = layer.CurrentWeight,
-			TargetWeight    = layer.TargetWeight,
-			Additive        = layer.Additive,
-			Isolated        = layer.Isolated,
+			Name             = layer.Name,
+			Order            = layer.Order,
+			CurrentWeight    = layer.CurrentWeight,
+			TargetWeight     = layer.TargetWeight,
+			Additive         = layer.Additive,
+			Isolated         = layer.Isolated,
 			ActiveTrackCount = #layer.ActiveTracks,
 		})
 	end
@@ -175,8 +191,11 @@ function LayerManager:GetSnapshot(): { { [string]: any } }
 end
 
 -- Validates layer invariants — used by DebugInspector:ValidateInvariants
-function LayerManager:ValidateInvariants(): { string }
+-- Bug #13 fix: added cross-validation between ActiveTracks and the caller-supplied
+-- activeWrappers map so that orphaned track registrations are surfaced.
+function LayerManager:ValidateInvariants(activeWrappers: { [string]: any }?): { string }
 	local violations = {}
+
 	-- Check sorted ascending order with no duplicates
 	for i = 2, #self._layers do
 		if self._layers[i].Order <= self._layers[i - 1].Order then
@@ -187,6 +206,31 @@ function LayerManager:ValidateInvariants(): { string }
 				))
 		end
 	end
+
+	-- Cross-check ActiveTracks against the controller's ActiveWrappers if provided.
+	-- An entry in ActiveTracks that is not in ActiveWrappers indicates a leak from
+	-- a wrapper that was retired without UnregisterTrack being called.
+	if activeWrappers then
+		for _, layer in self._layers do
+			for _, trackWrapper in layer.ActiveTracks do
+				local found = false
+				for _, w in activeWrappers do
+					if w == trackWrapper then
+						found = true
+						break
+					end
+				end
+				if not found then
+					table.insert(violations, string.format(
+						"Layer '%s' ActiveTracks contains a wrapper ('%s') not in AnimationController.ActiveWrappers — possible leak",
+						layer.Name,
+						trackWrapper.Config and trackWrapper.Config.Name or "unknown"
+						))
+				end
+			end
+		end
+	end
+
 	return violations
 end
 

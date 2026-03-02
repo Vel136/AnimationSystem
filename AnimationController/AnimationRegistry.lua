@@ -52,6 +52,20 @@ local function validateConfig(cfg: any): (boolean, string)
 	return true, ""
 end
 
+-- ── Deep Freeze ────────────────────────────────────────────────────────────
+
+-- Bug #19 fix: table.freeze is shallow. Metadata may contain nested tables
+-- that would remain mutable. We deep-freeze recursively to guarantee full
+-- immutability of config objects after Init.
+local function deepFreeze(t: { [any]: any }): { [any]: any }
+	for k, v in t do
+		if type(v) == "table" then
+			deepFreeze(v)
+		end
+	end
+	return table.freeze(t)
+end
+
 -- ── Module ─────────────────────────────────────────────────────────────────
 
 local AnimationRegistry = {}
@@ -79,7 +93,8 @@ function AnimationRegistry.GetInstance(): any
 	return _instance
 end
 
--- Reset for testing — not available in production builds
+-- Reset for testing — not available in production builds.
+-- Also clears the singleton so a new Init can be called.
 function AnimationRegistry._ResetForTest()
 	_instance = nil
 end
@@ -100,6 +115,12 @@ function AnimationRegistry:Init(configs: { any })
 			string.format("[AnimationRegistry] Duplicate animation name '%s' at index %d", cfg.Name, i)
 		)
 
+		-- Bug #19 fix: deep-freeze Metadata so nested tables are also immutable.
+		local frozenMetadata: { [string]: any }? = nil
+		if cfg.Metadata ~= nil then
+			frozenMetadata = deepFreeze(table.clone(cfg.Metadata)) :: { [string]: any }
+		end
+
 		local frozen: AnimationConfig = table.freeze({
 			Name         = cfg.Name,
 			AssetId      = cfg.AssetId,
@@ -115,7 +136,7 @@ function AnimationRegistry:Init(configs: { any })
 			Additive     = cfg.Additive,
 			Weight       = cfg.Weight,
 			MinDuration  = cfg.MinDuration,
-			Metadata     = cfg.Metadata and table.freeze(table.clone(cfg.Metadata)) or nil,
+			Metadata     = frozenMetadata,
 		})
 
 		-- Name index
@@ -139,10 +160,10 @@ function AnimationRegistry:Init(configs: { any })
 	end
 
 	-- Freeze all index arrays
-	for tag, arr in self._tagIndex do
+	for _, arr in self._tagIndex do
 		table.freeze(arr)
 	end
-	for group, arr in self._groupIndex do
+	for _, arr in self._groupIndex do
 		table.freeze(arr)
 	end
 

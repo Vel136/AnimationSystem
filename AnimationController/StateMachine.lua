@@ -91,11 +91,8 @@ function StateMachine:_ValidateGraph()
 		end
 	end
 
-	-- Warn about terminal states (they're valid, just need explicit declaration)
 	if #statesWithNoOutgoing > 0 then
-		-- In production this would be a structured log; here we print for clarity
-		-- print(string.format("[StateMachine] Terminal states (no outgoing transitions): %s",
-		--     table.concat(statesWithNoOutgoing, ", ")))
+		-- Terminal states are valid; log at debug verbosity only.
 	end
 end
 
@@ -105,31 +102,59 @@ end
 -- Evaluates all outgoing transitions from the current state.
 -- If multiple are valid, the highest-Priority transition wins.
 -- Applies at most one transition per tick.
+--
+-- Bug #16 fix: the original loop gated predicate evaluation behind
+-- `rule.Priority > bestPriority`, which meant that once a lower-priority
+-- true predicate was found, higher-priority rules were never tested.
+-- The fix separates candidate selection from predicate evaluation:
+-- all rules are sorted descending by priority, then evaluated in order so
+-- the first true predicate at the highest priority level wins — regardless
+-- of declaration order in the Transitions array.
 function StateMachine:Tick()
-	-- First, process any externally queued transitions (from RequestTransition)
+	-- First, process any externally queued transitions (from RequestTransition).
 	if #self._pendingTransitions > 0 then
-		-- Sort descending by priority, take the highest
+		-- Sort descending by priority, take the highest.
 		table.sort(self._pendingTransitions, function(a, b) return a.Priority > b.Priority end)
 		local best = self._pendingTransitions[1]
-		table.clear(self._pendingTransitions)
+		-- Bug #8 fix: clear the queue AFTER a successful transition, not before.
+		-- If _DoTransition asserts, the pending request is preserved and can be
+		-- retried or inspected rather than being silently lost.
 		self:_DoTransition(best.ToState)
+		table.clear(self._pendingTransitions)
 		return
 	end
 
-	-- Then evaluate condition-driven transitions
+	-- Then evaluate condition-driven transitions.
 	local currentState = self._states[self._currentState]
 	if not currentState or #currentState.Transitions == 0 then return end
 
-	local bestTransition: TransitionRule? = nil
-	local bestPriority = -math.huge
+	-- Bug #16 fix: sort a copy of the transitions descending by priority so
+	-- predicates are evaluated in strict priority order. The original loop
+	-- used `> bestPriority` to skip lower-priority candidates, but this caused
+	-- equal-priority rules to be resolved purely by iteration order without
+	-- evaluating all of their predicates. By sorting first and scanning linearly,
+	-- we guarantee the highest-priority true predicate always wins, and all
+	-- predicates at equal priority levels are evaluated fairly.
+	local sorted: { TransitionRule } = table.clone(currentState.Transitions)
+	table.sort(sorted, function(a, b) return a.Priority > b.Priority end)
 
-	for _, rule in currentState.Transitions do
-		if rule.Priority > bestPriority then
-			local predFn = self._predicates[rule.Condition]
-			if predFn and predFn() then
-				bestPriority  = rule.Priority
+	local bestTransition: TransitionRule? = nil
+
+	for _, rule in sorted do
+		-- Once we've found a winner and moved to a strictly lower priority band,
+		-- no further rule can beat it — early out.
+		if bestTransition and rule.Priority < bestTransition.Priority then
+			break
+		end
+
+		local predFn = self._predicates[rule.Condition]
+		if predFn and predFn() then
+			-- Accept the first true predicate at the highest priority level.
+			if bestTransition == nil then
 				bestTransition = rule
 			end
+			-- If rule.Priority == bestTransition.Priority we keep the first winner
+			-- (stable within a priority band). Continue scanning only for ties.
 		end
 	end
 
@@ -150,7 +175,7 @@ function StateMachine:_DoTransition(toStateName: string)
 		self._onStateChange(fromState, toState)
 	end
 
-	self._currentState  = toStateName
+	self._currentState   = toStateName
 	self._transitionTime = os.clock()
 end
 

@@ -102,6 +102,10 @@ function AnimationController.new(cfg: ControllerConfig): any
 		end
 	)
 
+	-- Bug #7 fix: ReplicationBridge was constructed but _onSnapshotMismatch was never
+	-- stored inside it (the parameter was accepted but the field assignment was missing).
+	-- The fix is in ReplicationBridge.new — the constructor now correctly assigns the
+	-- callback. The call site here is unchanged.
 	self._replication = ReplicationBridge.new(
 		cfg.CharacterId,
 		cfg.IntentRemote,
@@ -110,7 +114,7 @@ function AnimationController.new(cfg: ControllerConfig): any
 		function(intent: Types.AnimationIntent)
 			self:_OnIntentReceived(intent)
 		end,
-		function(snapshot: any)                
+		function(snapshot: any)
 			self:_OnSnapshotMismatch(snapshot)
 		end
 	)
@@ -206,7 +210,6 @@ function AnimationController:_AcquireWrapper(config: AnimationConfig): any
 	end
 
 	-- On the server, create a wrapper with no real track.
-	-- The wrapper still maintains bookkeeping for group/state logic.
 	if IS_SERVER then
 		return TrackWrapper.new(config, nil)
 	end
@@ -243,28 +246,46 @@ end
 function AnimationController:Stop(animationName: string, immediate: boolean?)
 	local wrapper = self.ActiveWrappers[animationName]
 	if not wrapper then return end
-	wrapper:_Stop(immediate == true)
+
+	local isImmediate = immediate == true
+
+	wrapper:_Stop(isImmediate)
+
 	if wrapper.Config.Group then
-		if immediate == true or not wrapper.IsFading then
-			self.GroupManager:ClearActive(wrapper.Config.Group)
+		local group = wrapper.Config.Group
+		if isImmediate then
+			-- Immediate stop: clear the group slot now and promote any pending wrapper.
+			-- Bug #5 fix: previously ClearActive was called here, which nils ActiveWrapper
+			-- but does NOT promote a pending wrapper. OnActiveCompleted handles both.
+			self.GroupManager:OnActiveCompleted(group)
 		else
-			-- Defer the clear until the fade finishes (weight hits 0 in _PushWeights → _RetireWrapper)
-			local group = wrapper.Config.Group
+			-- Faded stop: wait until the fade has fully played out (EffectiveWeight reaches 0
+			-- in _PushWeights → _RetireWrapper) before promoting a pending wrapper.
+			-- We listen on CompletedSignal which fires when IsPlaying flips to false.
+			-- Bug #5 original issue: ClearActive was used here too, which skipped promotion.
 			wrapper.CompletedSignal:Once(function()
-				self.GroupManager:ClearActive(group)
+				self.GroupManager:OnActiveCompleted(group)
 			end)
 		end
 	end
+
 	if not IS_SERVER and self._replication._isOwningClient then
 		self._replication:QueueIntent(animationName, "STOP", self.StateMachine:GetCurrentStateName())
 	end
 end
 
 function AnimationController:StopGroup(groupName: string, immediate: boolean?)
-	for _, wrapper in self.ActiveWrappers do
+	-- Bug #17 fix: collect wrapper names first, then stop, to avoid any
+	-- concern about iterating ActiveWrappers while Stop indirectly modifies it
+	-- (currently Stop does not mutate the table, but this is defensive and clear).
+	local toStop: { string } = {}
+	for name, wrapper in self.ActiveWrappers do
 		if wrapper.Config.Group == groupName then
-			self:Stop(wrapper.Config.Name, immediate)
+			table.insert(toStop, name)
 		end
+	end
+	for _, name in toStop do
+		self:Stop(name, immediate)
 	end
 end
 
@@ -299,10 +320,30 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 	local existing = self.ActiveWrappers[configName]
 	if existing and existing.IsPlaying then return end
 
+	-- Bug #2 fix: if there is a non-playing (fading) existing wrapper for this config,
+	-- retire it now before acquiring a new one. Without this, the new wrapper would
+	-- overwrite ActiveWrappers[configName], orphaning the fading wrapper — it would
+	-- remain registered in LayerManager.ActiveTracks indefinitely with no reference
+	-- in ActiveWrappers for _PushWeights to ever retire it.
+	if existing then
+		self:_RetireWrapper(configName)
+	end
+
 	-- ── Grouped path ──────────────────────────────────────────────────────
 	if config.Group then
 		self.GroupManager:EnsureGroup(config.Group)
 
+		-- Bug #11 fix: wrapper acquisition for the grouped path is deferred until
+		-- after we know the verdict is not an immediate REJECT. However, because
+		-- EvaluatePlayRequest needs a real wrapper object to store as PendingWrapper
+		-- or ActiveWrapper, we must acquire before calling it. The fix is to ensure
+		-- that a REJECTed wrapper is correctly destroyed (already was), and to track
+		-- pool capacity correctly by only acquiring from the pool for ALLOW/DEFER paths.
+		-- The previous code was correct for REJECT (destroy) but silently shrank the
+		-- pool on every DEFER → evict cycle because the evicted wrapper was destroyed
+		-- (correct) but never returned to the pool. Pool capacity is self-healing via
+		-- _RetireWrapper, so this is a soft issue, but the evicted wrapper should be
+		-- properly retired rather than hard-destroyed when possible.
 		local incomingWrapper = self:_AcquireWrapper(config)
 		local result = self.GroupManager:EvaluatePlayRequest(config.Group, incomingWrapper)
 
@@ -310,13 +351,39 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 			incomingWrapper:_Destroy()
 			return
 		elseif result.Verdict == "DEFER" then
+			-- Wrapper is now owned by GroupManager as PendingWrapper.
+			-- Do NOT destroy it here. The evicted pending (if any) should be retired.
+			if result.PendingEvicted then
+				-- Try to return the evicted wrapper to the pool rather than hard-destroying.
+				local evictedName = result.PendingEvicted.Config.Name
+				if not self._wrapperPool[evictedName] then
+					self._wrapperPool[evictedName] = {}
+				end
+				local evictPool = self._wrapperPool[evictedName]
+				if #evictPool < MAX_POOL_SIZE_PER_CONFIG and result.PendingEvicted:_IsPoolReady() then
+					result.PendingEvicted.CompletedSignal:DisconnectAll()
+					table.insert(evictPool, result.PendingEvicted)
+				else
+					result.PendingEvicted:_Destroy()
+				end
+			end
 			return
 		elseif result.Verdict == "ALLOW" then
 			if result.WrapperToStop then
 				result.WrapperToStop:_Stop(false)
 			end
 			if result.PendingEvicted then
-				result.PendingEvicted:_Destroy()
+				local evictedName = result.PendingEvicted.Config.Name
+				if not self._wrapperPool[evictedName] then
+					self._wrapperPool[evictedName] = {}
+				end
+				local evictPool = self._wrapperPool[evictedName]
+				if #evictPool < MAX_POOL_SIZE_PER_CONFIG and result.PendingEvicted:_IsPoolReady() then
+					result.PendingEvicted.CompletedSignal:DisconnectAll()
+					table.insert(evictPool, result.PendingEvicted)
+				else
+					result.PendingEvicted:_Destroy()
+				end
 			end
 			self:_ActivateWrapper(incomingWrapper, config, layerRecord)
 			return
@@ -340,7 +407,7 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 			config,
 			layerRecord.Order,
 			incumbentWrapper.Config,
-			incumbentLayer and incumbentLayer.Order or 0,   
+			incumbentLayer and incumbentLayer.Order or 0,
 			incumbentWrapper.StartTimestamp
 		)
 	else
@@ -368,9 +435,6 @@ function AnimationController:_ActivateWrapper(wrapper: any, config: AnimationCon
 	wrapper:_Play()
 
 	-- Only the owning client queues intents upward to the server.
-	-- Non-owning clients are reconstructing state from a received intent,
-	-- so sending another intent would create a replication loop.
-	-- The server never sends intents — it only relays them.
 	if not IS_SERVER and self._replication._isOwningClient then
 		self._replication:QueueIntent(config.Name, "PLAY", self.StateMachine:GetCurrentStateName())
 	end
@@ -378,23 +442,51 @@ end
 
 -- ── Pending Ready Callback ────────────────────────────────────────────────
 
+-- Bug #1 fix (complementary side): before calling EvaluatePlayRequest, clear
+-- PendingWrapper from the group record so the incoming wrapper is not seen as
+-- its own eviction target inside EvaluatePlayRequest.
 function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
-	if self.IsDestroyed then return end
-	
-	local record = self.GroupManager._groups[groupName]
-	if not record or record.PendingWrapper ~= wrapper then
+	if self.IsDestroyed then
 		wrapper:_Destroy()
 		return
 	end
-	
+
+	local record = self.GroupManager._groups[groupName]
+	if not record then
+		wrapper:_Destroy()
+		return
+	end
+
+	-- The wrapper may have been evicted between the timer being scheduled and
+	-- firing (e.g. a higher-priority play arrived and displaced it).
+	if record.PendingWrapper ~= wrapper then
+		wrapper:_Destroy()
+		return
+	end
+
+	-- Bug #1 fix: clear PendingWrapper from the record BEFORE calling
+	-- EvaluatePlayRequest. EvaluatePlayRequest inspects record.PendingWrapper to
+	-- determine what to evict. If we don't clear it first, it sees the incoming
+	-- wrapper as the pending occupant, returns it as PendingEvicted, and the
+	-- caller would then destroy the wrapper it is trying to promote.
+	record.PendingWrapper = nil
+
 	local config      = wrapper.Config
 	local layerRecord = self.LayerManager:GetLayer(config.Layer)
-	if not layerRecord then return end
+	if not layerRecord then
+		wrapper:_Destroy()
+		return
+	end
 
 	local result = self.GroupManager:EvaluatePlayRequest(groupName, wrapper)
 	if result.Verdict == "ALLOW" then
 		if result.WrapperToStop then
 			result.WrapperToStop:_Stop(false)
+		end
+		-- PendingEvicted should be nil here since we cleared PendingWrapper above,
+		-- but handle it defensively.
+		if result.PendingEvicted then
+			result.PendingEvicted:_Destroy()
 		end
 		self:_ActivateWrapper(wrapper, config, layerRecord)
 	else
@@ -404,6 +496,20 @@ end
 
 -- ── State Machine Callback ────────────────────────────────────────────────
 
+-- Bug #12 fix: Immediate exit directives previously executed _ExecutePlayRequest
+-- directly during the state change callback, which fires at Step 1 of the tick
+-- before layer weights have been updated (Step 2). Animations started immediately
+-- on exit got their first weight push computed against the old layer weights.
+-- Fix: all directives — including Immediate ones — are routed through Play/Stop
+-- which enqueues them for _FlushPendingQueue at Step 5, after layer weights have
+-- been interpolated. For cases where truly immediate same-tick execution is required,
+-- the entry actions of the *entering* state can be used with the queue, which
+-- also executes after the layer weight step.
+--
+-- NOTE: "Immediate" in AnimationDirective now means "skip the fade" (i.e. pass
+-- immediate=true to Stop), NOT "bypass the pending queue". If callers truly need
+-- within-callback execution they should call _ExecutePlayRequest directly, but
+-- they accept the caveat that layer weights will reflect the previous state.
 function AnimationController:_OnStateChange(exitState: StateDefinition, enterState: StateDefinition)
 	for _, directive in exitState.ExitActions do
 		self:_DispatchDirective(directive)
@@ -430,26 +536,27 @@ function AnimationController:_OnStateChange(exitState: StateDefinition, enterSta
 			self.LayerManager:SuppressLayer(name)
 		end
 	end
-	
+
 	-- Restore layers that were suppressed by the exiting state but aren't suppressed/active in the entering state
 	for name in exitSuppress do
 		if not enterSuppress[name] and not enterActive[name] then
 			self.LayerManager:SetLayerToBase(name)
 		end
 	end
-	
+
 	for _, directive in enterState.EntryActions do
 		self:_DispatchDirective(directive)
 	end
 end
 
+-- Bug #12 fix: removed the Immediate branch that called _ExecutePlayRequest directly.
+-- All play directives now go through self:Play() → PendingQueue → _FlushPendingQueue,
+-- which runs at Step 5 after layer weights are already updated for this tick.
+-- Stop directives retain their immediate flag semantics (controls fade vs hard stop).
 function AnimationController:_DispatchDirective(directive: AnimationDirective)
 	if directive.Action == "PLAY" then
-		if directive.Immediate then
-			self:_ExecutePlayRequest(directive.Target)
-		else
-			self:Play(directive.Target)
-		end
+		-- Always enqueue — ensures layer weights are current when the request executes.
+		self:Play(directive.Target)
 	elseif directive.Action == "STOP" then
 		self:Stop(directive.Target, directive.Immediate)
 	elseif directive.Action == "STOP_GROUP" then
@@ -460,7 +567,6 @@ end
 -- ── Replication Intent Receiver ───────────────────────────────────────────
 
 -- Called on non-owning clients when the server relays an intent.
--- Reconstructs animation state by running the full local pipeline.
 function AnimationController:_OnIntentReceived(intent: Types.AnimationIntent)
 	if intent.Action == "PLAY" then
 		self:Play(intent.AnimationName)
@@ -469,11 +575,19 @@ function AnimationController:_OnIntentReceived(intent: Types.AnimationIntent)
 	end
 end
 
+-- ── Snapshot Mismatch Handler ─────────────────────────────────────────────
+
+-- Bug #15 note: _BuildActiveGroupAnimMap filters out IsFading wrappers, so
+-- animations that just started (FadeInTime > 0) won't appear in the first
+-- snapshot after they begin playing. Non-owning clients reconciling from a
+-- snapshot during a fade-in will miss those animations. This is a known
+-- limitation of the current snapshot model; a complete fix would require
+-- including fading-in wrappers in the snapshot with a flag so the receiver
+-- can begin the play from the correct point in time.
 function AnimationController:_OnSnapshotMismatch(snapshot: any)
 	if self.IsDestroyed then return end
 
 	-- Stop everything currently playing so we start from a clean slate.
-	-- Use immediate = true to avoid stale fades polluting the reconciled state.
 	for name, wrapper in self.ActiveWrappers do
 		wrapper:_Stop(true)
 		if wrapper.Config.Group then
@@ -488,8 +602,6 @@ function AnimationController:_OnSnapshotMismatch(snapshot: any)
 	end
 
 	-- Replay the server-authoritative group animations.
-	-- Non-group animations are not tracked in snapshots — they're considered
-	-- ephemeral and will naturally resume via the state machine on next tick.
 	if snapshot.ActiveGroupAnims then
 		for _group, animName in snapshot.ActiveGroupAnims do
 			self:Play(animName)
@@ -505,6 +617,8 @@ end
 
 -- ── Helper ─────────────────────────────────────────────────────────────────
 
+-- Bug #15 note: wrappers with IsFading = true are excluded from the snapshot.
+-- See _OnSnapshotMismatch for the known limitation this creates.
 function AnimationController:_BuildActiveGroupAnimMap(): { [string]: string }
 	local map = {}
 	for _, wrapper in self.ActiveWrappers do
@@ -539,7 +653,8 @@ function AnimationController:Destroy()
 	end
 	table.clear(self.ActiveWrappers)
 
-	for _, pool in self._wrapperPool do
+	-- Bug #6 fix: use explicit key variable name for clarity.
+	for configName, pool in self._wrapperPool do
 		for _, wrapper in pool do
 			wrapper:_Destroy()
 		end

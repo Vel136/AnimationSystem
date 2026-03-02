@@ -50,7 +50,7 @@ ReplicationBridge.__index = ReplicationBridge
 
 export type ReplicationBridge = typeof(setmetatable({} :: {
 	_isServer        : boolean,
-	_isOwningClient  : boolean,   -- true only on the client that owns this character
+	_isOwningClient  : boolean,
 	_characterId     : string,
 	_intentRemote    : RemoteEvent?,
 	_snapshotRemote  : RemoteEvent?,
@@ -66,37 +66,39 @@ export type ReplicationBridge = typeof(setmetatable({} :: {
 }, ReplicationBridge))
 
 -- isOwningClient: pass true only on the client that owns this character.
--- On the server and on non-owning clients this should be false.
 function ReplicationBridge.new(
-	characterId      : string,
-	intentRemote     : RemoteEvent?,
-	snapshotRemote   : RemoteEvent?,
-	isOwningClient   : boolean,
-	onIntentReceived : ((AnimationIntent) -> ())?,
+	characterId        : string,
+	intentRemote       : RemoteEvent?,
+	snapshotRemote     : RemoteEvent?,
+	isOwningClient     : boolean,
+	onIntentReceived   : ((AnimationIntent) -> ())?,
 	onSnapshotMismatch : ((any) -> ())?
 ): ReplicationBridge
 
 	local isServer = RunService:IsServer()
 
+	-- Bug #7 fix: _onSnapshotMismatch was accepted as a parameter but never
+	-- assigned to the instance. The field existed in the type declaration and
+	-- _HandleSnapshot called it, but because the assignment was missing the
+	-- callback was always nil and snapshot reconciliation never fired.
 	local self = setmetatable({
-		_isServer        = isServer,
-		_isOwningClient  = (not isServer) and isOwningClient,
-		_characterId     = characterId,
-		_intentRemote    = intentRemote,
-		_snapshotRemote  = snapshotRemote,
-		_intentQueue     = {},
-		_intentPool      = makeIntentPool(INTENT_POOL_SIZE),
-		_poolCursor      = 1,
-		_sequenceNumber  = 0,
-		_snapshotTimer   = 0,
-		_connections     = {},
-		_destroyed       = false,
-		_onIntentReceived = onIntentReceived,
+		_isServer           = isServer,
+		_isOwningClient     = (not isServer) and isOwningClient,
+		_characterId        = characterId,
+		_intentRemote       = intentRemote,
+		_snapshotRemote     = snapshotRemote,
+		_intentQueue        = {},
+		_intentPool         = makeIntentPool(INTENT_POOL_SIZE),
+		_poolCursor         = 1,
+		_sequenceNumber     = 0,
+		_snapshotTimer      = 0,
+		_connections        = {},
+		_destroyed          = false,
+		_onIntentReceived   = onIntentReceived,
+		_onSnapshotMismatch = onSnapshotMismatch,  -- was missing in original
 	}, ReplicationBridge)
 
 	if isServer then
-		-- Server listens for intents FROM the owning client,
-		-- validates them, then rebroadcasts to all other clients.
 		if intentRemote then
 			local conn = intentRemote.OnServerEvent:Connect(function(player: Player, intent: AnimationIntent)
 				self:_HandleClientIntent(player, intent)
@@ -104,8 +106,6 @@ function ReplicationBridge.new(
 			table.insert(self._connections, conn)
 		end
 	else
-		-- Non-owning clients listen for rebroadcast intents from the server.
-		-- The owning client does NOT listen — it already played locally.
 		if not isOwningClient and intentRemote then
 			local conn = intentRemote.OnClientEvent:Connect(function(intent: AnimationIntent)
 				self:_HandleIncomingIntent(intent)
@@ -113,7 +113,6 @@ function ReplicationBridge.new(
 			table.insert(self._connections, conn)
 		end
 
-		-- All clients (owning and non-owning) listen for snapshots for desync recovery.
 		if snapshotRemote then
 			local conn = snapshotRemote.OnClientEvent:Connect(function(snapshot: any)
 				self:_HandleSnapshot(snapshot)
@@ -135,23 +134,16 @@ end
 
 function ReplicationBridge:_RecycleIntent(_intent: AnimationIntent)
 	-- Pool is circular; slots are overwritten automatically.
-	-- Kept as an explicit hook for future instrumentation.
 end
 
 -- ── Queueing — Owning Client Only ─────────────────────────────────────────
 
--- Called by AnimationController when a play or stop is applied locally.
--- Only the owning client queues intents for transmission to the server.
--- The server and non-owning clients never call this.
 function ReplicationBridge:QueueIntent(
 	animationName : string,
 	action        : "PLAY" | "STOP",
 	stateContext  : string
 )
 	if self._destroyed then return end
-
-	-- Only the owning client sends intents upstream to the server.
-	-- The server relays; non-owning clients only receive.
 	if not self._isOwningClient then return end
 
 	local intent = self:_AcquireIntent()
@@ -166,15 +158,10 @@ end
 
 -- ── Per-Tick Flush ─────────────────────────────────────────────────────────
 
--- Called at step 4 of the per-frame pipeline.
--- Owning client: flushes queued intents up to the server.
--- Server: handles periodic snapshot broadcast to all clients.
--- Non-owning clients: nothing to flush, they only receive.
 function ReplicationBridge:Flush(dt: number, currentStateName: string, activeGroupAnims: { [string]: string })
 	if self._destroyed then return end
 
 	if self._isOwningClient then
-		-- Owning client sends its queued intents to the server.
 		if #self._intentQueue > 0 and self._intentRemote then
 			for _, intent in self._intentQueue do
 				self._intentRemote:FireServer(intent)
@@ -184,8 +171,6 @@ function ReplicationBridge:Flush(dt: number, currentStateName: string, activeGro
 		end
 	end
 
-	-- Server broadcasts periodic full-state snapshots for desync recovery.
-	-- Non-owning clients use these to catch up if they missed intents.
 	if self._isServer and self._snapshotRemote then
 		self._snapshotTimer += dt
 		if self._snapshotTimer >= SNAPSHOT_INTERVAL_S then
@@ -204,15 +189,10 @@ end
 
 -- ── Server: Receiving From Owning Client ───────────────────────────────────
 
--- The server receives an intent from the owning client, performs a staleness
--- check, then rebroadcasts to all OTHER clients so they can reconstruct state.
--- The server does not play the animation itself.
 function ReplicationBridge:_HandleClientIntent(player: Player, intent: AnimationIntent)
 	if self._destroyed then return end
 	if intent.CharacterId ~= self._characterId then return end
 
-	-- Discard stale intents — if the owning client is very far behind,
-	-- applying old intents would produce incorrect state on other clients.
 	local age = os.clock() - intent.Timestamp
 	if age > STALE_INTENT_THRESHOLD_S then
 		warn(string.format(
@@ -224,8 +204,6 @@ function ReplicationBridge:_HandleClientIntent(player: Player, intent: Animation
 
 	self._sequenceNumber += 1
 
-	-- Rebroadcast to all clients EXCEPT the owning client who already played locally.
-	-- FireAllClients would replay the animation on the owning client, causing a double-play.
 	if self._intentRemote then
 		for _, client in game:GetService("Players"):GetPlayers() do
 			if client ~= player then
@@ -237,8 +215,6 @@ end
 
 -- ── Non-Owning Clients: Receiving From Server ──────────────────────────────
 
--- Non-owning clients receive rebroadcast intents and reconstruct animation
--- state by running the full local pipeline via the onIntentReceived callback.
 function ReplicationBridge:_HandleIncomingIntent(intent: AnimationIntent)
 	if self._destroyed then return end
 	if intent.CharacterId ~= self._characterId then return end
@@ -268,12 +244,14 @@ function ReplicationBridge:_HandleSnapshot(snapshot: SnapshotData)
 			self._characterId, self._sequenceNumber, snapshot.SequenceNumber
 			))
 		self._sequenceNumber = snapshot.SequenceNumber
+		-- Bug #7 fix: this callback was always nil in the original because the
+		-- constructor never stored it. Now correctly fires AnimationController's
+		-- _OnSnapshotMismatch for desync recovery.
 		if self._onSnapshotMismatch then
 			self._onSnapshotMismatch(snapshot)
 		end
 	end
 end
-
 
 -- ── Sequence Management ────────────────────────────────────────────────────
 

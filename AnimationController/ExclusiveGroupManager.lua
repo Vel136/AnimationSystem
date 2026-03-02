@@ -25,6 +25,7 @@ export type ExclusiveGroupManager = typeof(setmetatable({} :: {
 	_groups         : { [string]: GroupRecord },
 	_pendingTimers  : { [string]: thread? }, -- per-group coroutine watching MinDuration expiry
 	_onPendingReady : ((groupName: string, wrapper: any) -> ())?,
+	_destroyed      : boolean,
 }, ExclusiveGroupManager))
 
 -- onPendingReady: callback issued when a deferred request becomes eligible to play.
@@ -34,6 +35,7 @@ function ExclusiveGroupManager.new(onPendingReady: ((string, any) -> ())?): Excl
 		_groups         = {},
 		_pendingTimers  = {},
 		_onPendingReady = onPendingReady,
+		_destroyed      = false,
 	}, ExclusiveGroupManager)
 end
 
@@ -67,13 +69,14 @@ function ExclusiveGroupManager:EvaluatePlayRequest(groupName: string, incomingWr
 
 	-- Step 2: no active wrapper → ALLOW immediately
 	if record.ActiveWrapper == nil then
-		record.ActiveWrapper = incomingWrapper
+		record.ActiveWrapper  = incomingWrapper
+		record.PendingWrapper = nil
 		return { Verdict = "ALLOW", WrapperToStop = nil, PendingEvicted = nil }
 	end
 
-	local active    = record.ActiveWrapper
+	local active       = record.ActiveWrapper
 	local activeConfig = active.Config
-	local now       = os.clock()
+	local now          = os.clock()
 
 	-- Step 3: CanInterrupt = false path
 	if not activeConfig.CanInterrupt then
@@ -81,8 +84,14 @@ function ExclusiveGroupManager:EvaluatePlayRequest(groupName: string, incomingWr
 		local minDur  = activeConfig.MinDuration or 0
 
 		if elapsed < minDur then
-			-- MinDuration not yet satisfied — DEFER
+			-- MinDuration not yet satisfied — DEFER.
+			-- Evict any stale pending before storing the new one.
 			local evicted = record.PendingWrapper
+			-- Bug #1 fix: guard against evicting the incoming wrapper itself.
+			-- This can happen if _OnPendingReady re-evaluates the same wrapper.
+			if evicted == incomingWrapper then
+				evicted = nil
+			end
 			record.PendingWrapper = incomingWrapper
 
 			-- Set up a timer to re-evaluate once MinDuration expires
@@ -94,8 +103,16 @@ function ExclusiveGroupManager:EvaluatePlayRequest(groupName: string, incomingWr
 		end
 	end
 
-	-- Step 4: CanInterrupt = true (or effectively so) → ALLOW
-	local evicted = record.PendingWrapper -- clear any stale pending
+	-- Step 4: CanInterrupt = true (or effectively so) → ALLOW.
+	-- Bug #1 fix: only evict PendingWrapper if it is a different object from incomingWrapper.
+	-- When _OnPendingReady promotes a pending wrapper it calls EvaluatePlayRequest with the
+	-- same wrapper object that is currently stored as PendingWrapper. Without this guard the
+	-- evicted field would point to incomingWrapper itself, and the caller would destroy the
+	-- wrapper it is about to activate.
+	local evicted = record.PendingWrapper
+	if evicted == incomingWrapper then
+		evicted = nil
+	end
 	record.PendingWrapper = nil
 	record.ActiveWrapper  = incomingWrapper
 
@@ -108,9 +125,16 @@ function ExclusiveGroupManager:_SchedulePendingReeval(groupName: string, delay: 
 	-- Cancel any existing timer for this group
 	if self._pendingTimers[groupName] then
 		task.cancel(self._pendingTimers[groupName])
+		self._pendingTimers[groupName] = nil
 	end
 
 	self._pendingTimers[groupName] = task.delay(delay, function()
+		-- Bug #10 fix: check _destroyed flag before touching any state.
+		-- task.cancel is not guaranteed to prevent a same-frame resume, so we
+		-- must guard with an explicit destroyed check rather than relying solely
+		-- on table.clear having removed the group record.
+		if self._destroyed then return end
+
 		self._pendingTimers[groupName] = nil
 		local record = self._groups[groupName]
 		if not record then return end
@@ -153,20 +177,28 @@ function ExclusiveGroupManager:ClearActive(groupName: string)
 	end
 end
 
--- Called by AnimationController:Destroy — cancels all timers
+-- Called by AnimationController:Destroy — cancels all timers.
+-- Bug #10 fix: set _destroyed = true BEFORE cancelling timers and clearing tables
+-- so that any timer that races to fire on the same frame sees the flag and returns
+-- immediately, without accessing cleared state.
 function ExclusiveGroupManager:Destroy()
+	if self._destroyed then return end
+	self._destroyed = true
+
 	for groupName, thread in self._pendingTimers do
 		if thread then
 			task.cancel(thread)
 		end
 	end
-	-- destroy any pending wrappers that never got promoted
+
+	-- Destroy any pending wrappers that never got promoted.
 	for _, record in self._groups do
 		if record.PendingWrapper then
 			record.PendingWrapper:_Destroy()
 			record.PendingWrapper = nil
 		end
 	end
+
 	table.clear(self._pendingTimers)
 	table.clear(self._groups)
 end
@@ -188,8 +220,6 @@ function ExclusiveGroupManager:GetSnapshot(): { { [string]: any } }
 end
 
 -- Validates group invariants — used by DebugInspector:ValidateInvariants
--- No two active wrappers in the same group should have non-zero EffectiveWeight.
--- (Only one active wrapper per group is enforced structurally, so this validates the record.)
 function ExclusiveGroupManager:ValidateInvariants(): { string }
 	local violations = {}
 	for groupName, record in self._groups do

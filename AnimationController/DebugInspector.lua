@@ -31,21 +31,21 @@ function DebugInspector:GetActiveWrappers(): { { [string]: any } }
 	for _, wrapper in ctrl.ActiveWrappers do
 		local layerRecord = ctrl.LayerManager:GetLayer(wrapper.Config.Layer)
 		table.insert(results, {
-			Name      = wrapper.Config.Name,
-			Layer     = wrapper.Config.Layer,
+			Name       = wrapper.Config.Name,
+			Layer      = wrapper.Config.Layer,
 			LayerOrder = layerRecord and layerRecord.Order or 0,
-			Group     = wrapper.Config.Group,
-			Weight    = wrapper.EffectiveWeight,
-			Timestamp = wrapper.StartTimestamp,
-			IsPlaying = wrapper.IsPlaying,
-			IsFading  = wrapper.IsFading,
-			Priority  = wrapper.Config.Priority,
+			Group      = wrapper.Config.Group,
+			Weight     = wrapper.EffectiveWeight,
+			Timestamp  = wrapper.StartTimestamp,
+			IsPlaying  = wrapper.IsPlaying,
+			IsFading   = wrapper.IsFading,
+			Priority   = wrapper.Config.Priority,
 		})
 	end
 
 	table.sort(results, function(a, b)
 		if a.LayerOrder ~= b.LayerOrder then
-			return a.LayerOrder > b.LayerOrder -- descending order
+			return a.LayerOrder > b.LayerOrder
 		end
 		return a.Priority > b.Priority
 	end)
@@ -84,18 +84,16 @@ function DebugInspector:GetAnimationTree(): string
 	local layers = ctrl.LayerManager:GetAllLayers()
 	local lines  = {}
 
-	-- Sort layers ascending by Order (already sorted in LayerManager, but explicit for clarity)
 	for _, layer in layers do
 		local layerLine = string.format(
 			"Layer[%d] '%s'  cw=%.3f  tw=%.3f  %s%s",
 			layer.Order, layer.Name,
 			layer.CurrentWeight, layer.TargetWeight,
-			layer.Additive  and "[ADDITIVE] " or "",
-			layer.Isolated  and "[ISOLATED]" or ""
+			layer.Additive and "[ADDITIVE] " or "",
+			layer.Isolated and "[ISOLATED]" or ""
 		)
 		table.insert(lines, layerLine)
 
-		-- Collect wrappers on this layer, sorted by Config.Priority desc, then StartTimestamp asc
 		local wrappers = {}
 		for _, wrapper in ctrl.ActiveWrappers do
 			if wrapper.Config.Layer == layer.Name then
@@ -177,8 +175,11 @@ function DebugInspector:ValidateInvariants(): { Valid: boolean, Violations: { st
 		end
 	end
 
-	-- Invariant: LayerManager layers sorted ascending with no duplicates
-	local layerViolations = ctrl.LayerManager:ValidateInvariants()
+	-- Invariant: LayerManager layers sorted ascending with no duplicates.
+	-- Bug #13 fix: pass ActiveWrappers so LayerManager can cross-validate
+	-- ActiveTracks against the controller's live wrapper set, surfacing leaks
+	-- where UnregisterTrack was not called for a retired wrapper.
+	local layerViolations = ctrl.LayerManager:ValidateInvariants(ctrl.ActiveWrappers)
 	for _, v in layerViolations do
 		table.insert(violations, v)
 	end
