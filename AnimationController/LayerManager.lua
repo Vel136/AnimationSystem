@@ -112,7 +112,7 @@ export type LayerManager = typeof(setmetatable({} :: {
         starts at its natural weight with no lerp needed.
 ]=]
 function LayerManager.new(Profiles: { LayerProfile }): LayerManager
-	local Self = setmetatable({
+	local self = setmetatable({
 		_Layers      = {} :: { LayerRecord },
 		_LayerByName = {} :: { [string]: LayerRecord },
 	}, LayerManager)
@@ -131,7 +131,7 @@ function LayerManager.new(Profiles: { LayerProfile }): LayerManager
 			)
 		)
 		assert(
-			not Self._LayerByName[Profile.Name],
+			not self._LayerByName[Profile.Name],
 			string.format("[LayerManager] Duplicate layer name '%s'", Profile.Name)
 		)
 		SeenOrders[Profile.Order] = true
@@ -150,18 +150,18 @@ function LayerManager.new(Profiles: { LayerProfile }): LayerManager
 			ActiveTracks   = {},
 		}
 
-		table.insert(Self._Layers, Record)
-		Self._LayerByName[Profile.Name] = Record
+		table.insert(self._Layers, Record)
+		self._LayerByName[Profile.Name] = Record
 	end
 
 	-- Sort ascending by Order so _Layers[1] is always the lowest-priority layer.
 	-- This order is used by DebugInspector:GetAnimationTree for display and by
 	-- ConflictResolver which compares Order values numerically.
-	table.sort(Self._Layers, function(A, B)
+	table.sort(self._Layers, function(A, B)
 		return A.Order < B.Order
 	end)
 
-	return Self
+	return self
 end
 
 -- ─── Layer Queries ────────────────────────────────────────────────────────────

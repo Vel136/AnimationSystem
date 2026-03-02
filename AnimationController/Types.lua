@@ -299,11 +299,6 @@ export type AnimationIntent = {
 	-- _HandleClientIntent is meaningful across the network boundary.
 	-- Intents older than STALE_INTENT_THRESHOLD_S are discarded as too late to be useful.
 	Timestamp: number,
-
-	-- The StateMachine's current state name at intent creation time.
-	-- Informational: lets non-owning clients and debugging tools correlate network
-	-- traffic with state transitions. Not currently used for validation.
-	StateContext: string,
 }
 
 -- ─── Play Request ─────────────────────────────────────────────────────────────

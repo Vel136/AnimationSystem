@@ -55,7 +55,7 @@ export type DebugInspector = typeof(setmetatable({} :: {
 -- ─── Constructor ──────────────────────────────────────────────────────────────
 
 --[=[
-    DebugInspector.New
+    DebugInspector.new
 
     Description:
         Constructs a new DebugInspector attached to the given AnimationController
@@ -79,7 +79,7 @@ export type DebugInspector = typeof(setmetatable({} :: {
         DebugInspector
             A ready-to-use inspector bound to the provided controller.
 ]=]
-function DebugInspector.New(Controller: any): DebugInspector
+function DebugInspector.new(Controller: any): DebugInspector
 	assert(Controller, "[DebugInspector] Must be attached to a live AnimationController")
 	return setmetatable({
 		_Controller = Controller,

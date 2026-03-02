@@ -112,7 +112,7 @@ export type StateMachine = typeof(setmetatable({} :: {
 -- ─── Constructor ──────────────────────────────────────────────────────────────
 
 --[=[
-    StateMachine.New
+    StateMachine.new
 
     Description:
         Constructs a new StateMachine instance, indexes all provided state
@@ -156,14 +156,14 @@ export type StateMachine = typeof(setmetatable({} :: {
         missing initial state. These are all programming errors that must be
         caught at startup, not silently ignored at runtime.
 ]=]
-function StateMachine.New(
+function StateMachine.new(
 	States        : { StateDefinition },
 	InitialState  : string,
 	Predicates    : { [string]: PredicateFn },
 	OnStateChange : ((StateDefinition, StateDefinition) -> ())?
 ): StateMachine
 
-	local Self = setmetatable({
+	local self = setmetatable({
 		_States             = {} :: { [string]: StateDefinition },
 		_Predicates         = Predicates,
 		_CurrentState       = InitialState,
@@ -178,24 +178,24 @@ function StateMachine.New(
 	-- perform O(1) lookups instead of scanning the array on every access.
 	for _, StateRecord in States do
 		assert(
-			not Self._States[StateRecord.Name],
+			not self._States[StateRecord.Name],
 			string.format("[StateMachine] Duplicate state name '%s'", StateRecord.Name)
 		)
-		Self._States[StateRecord.Name] = StateRecord
+		self._States[StateRecord.Name] = StateRecord
 	end
 
 	-- Verify the requested initial state actually exists. Failing here is
 	-- intentional — an FSM with a nonexistent starting state cannot function.
 	assert(
-		Self._States[InitialState],
+		self._States[InitialState],
 		string.format("[StateMachine] Initial state '%s' not defined", InitialState)
 	)
 
 	-- Validate the full graph and build pre-sorted transition tables.
 	-- This is the only moment we allocate the sorted arrays; Tick reuses them.
-	Self:_ValidateGraph()
+	self:_ValidateGraph()
 
-	return Self
+	return self
 end
 
 -- ─── Graph Validation ─────────────────────────────────────────────────────────
@@ -218,10 +218,10 @@ end
         IsTerminal exposes this for external query.
 
     Parameters:
-        None. Operates entirely on Self.
+        None. Operates entirely on self.
 
     Returns:
-        Nothing. Mutates Self._TerminalStates and Self._SortedTransitions in place.
+        Nothing. Mutates self._TerminalStates and self._SortedTransitions in place.
 
     Notes:
         This is the primary safety net for configuration errors. In a shipping
@@ -419,7 +419,7 @@ end
         Nothing. Mutates _CurrentState, _TransitionTime, and fires _OnStateChange.
 
     Notes:
-        Self-transition guard:
+        self-transition guard:
             If ToStateName equals the current state, the method returns immediately
             without firing _OnStateChange. This matters because a self-transition
             would execute all ExitActions followed by all EntryActions for the same
@@ -435,7 +435,7 @@ end
             state name, corrupting the replication StateContext field.
 ]=]
 function StateMachine:_DoTransition(ToStateName: string)
-	-- Self-transitions are silently suppressed. Replaying exit and entry actions
+	-- self-transitions are silently suppressed. Replaying exit and entry actions
 	-- for a state the FSM is already in would stop and restart animations that
 	-- should be playing continuously (e.g. an idle loop). Guard against this.
 	if ToStateName == self._CurrentState then

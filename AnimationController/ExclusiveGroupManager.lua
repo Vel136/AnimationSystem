@@ -129,6 +129,43 @@ function ExclusiveGroupManager.new(
 	}, ExclusiveGroupManager)
 end
 
+-- ─── Pending Lifecycle ──────────────────────────────────────────────────────────
+
+--[=[
+    GetActiveWrapper
+    Returns the wrapper currently occupying the active slot for a group, or nil
+    if the group is unknown or the slot is empty.
+]=]
+function ExclusiveGroupManager:GetActiveWrapper(GroupName: string): any?
+	local Record = self._Groups[GroupName]
+	return Record and Record.ActiveWrapper or nil
+end
+
+--[=[
+    GetPendingWrapper
+    Returns the wrapper currently sitting in the pending slot for a group, or nil
+    if the group is unknown or no wrapper is pending.
+    Returns nil for unknown groups, so callers can combine the existence check
+    and the identity check into a single comparison.
+]=]
+function ExclusiveGroupManager:GetPendingWrapper(GroupName: string): any?
+	local Record = self._Groups[GroupName]
+	return Record and Record.PendingWrapper or nil
+end
+
+--[=[
+    ClearPending
+    Sets the pending slot for a group to nil without triggering any promotion.
+    Used by AnimationController._OnPendingReady before calling EvaluatePlayRequest
+    so the incoming wrapper is not returned as its own eviction target (Bug #1 fix).
+]=]
+function ExclusiveGroupManager:ClearPending(GroupName: string)
+	local Record = self._Groups[GroupName]
+	if Record then
+		Record.PendingWrapper = nil
+	end
+end
+
 -- ─── Group Lifecycle ──────────────────────────────────────────────────────────
 
 --[=[
@@ -231,8 +268,8 @@ function ExclusiveGroupManager:EvaluatePlayRequest(GroupName: string, IncomingWr
 			-- that is currently stored as PendingWrapper (promotion path). If we
 			-- returned IncomingWrapper as PendingEvicted, the caller would destroy
 			-- the wrapper it is trying to activate.
-			local IsEvictingSelf = EvictedPending == IncomingWrapper
-			if IsEvictingSelf then
+			local IsEvictingself = EvictedPending == IncomingWrapper
+			if IsEvictingself then
 				EvictedPending = nil
 			end
 
@@ -258,8 +295,8 @@ function ExclusiveGroupManager:EvaluatePlayRequest(GroupName: string, IncomingWr
 	local EvictedPending = Record.PendingWrapper
 
 	-- Bug #1 fix: same guard as Step 3 — don't evict the incoming wrapper itself.
-	local IsEvictingSelf = EvictedPending == IncomingWrapper
-	if IsEvictingSelf then
+	local IsEvictingself = EvictedPending == IncomingWrapper
+	if IsEvictingself then
 		EvictedPending = nil
 	end
 

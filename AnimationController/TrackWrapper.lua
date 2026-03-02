@@ -40,7 +40,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
-local Signal     = require(script.Parent.Signal)
+local Signal     = require(script.Parent.sign)
 local Types      = require(script.Parent.Types)
 
 type AnimationConfig = Types.AnimationConfig
@@ -66,14 +66,14 @@ export type TrackWrapper = {
 	PlaybackSpeed:   number,
 	CompletedSignal: Signal.Signal<()>,
 
-	_Play:               (Self: TrackWrapper) -> (),
-	_Stop:               (Self: TrackWrapper, Immediate: boolean) -> (),
-	_SetTargetWeight:    (Self: TrackWrapper, Weight: number) -> (),
-	_SetEffectiveWeight: (Self: TrackWrapper, Weight: number) -> (),
-	_SetSpeed:           (Self: TrackWrapper, Speed: number) -> (),
-	_Reinitialize:       (Self: TrackWrapper) -> (),
-	_Destroy:            (Self: TrackWrapper) -> (),
-	_IsPoolReady:        (Self: TrackWrapper) -> boolean,
+	_Play:               (self: TrackWrapper) -> (),
+	_Stop:               (self: TrackWrapper, Immediate: boolean) -> (),
+	_SetTargetWeight:    (self: TrackWrapper, Weight: number) -> (),
+	_SetEffectiveWeight: (self: TrackWrapper, Weight: number) -> (),
+	_SetSpeed:           (self: TrackWrapper, Speed: number) -> (),
+	_Reinitialize:       (self: TrackWrapper) -> (),
+	_Destroy:            (self: TrackWrapper) -> (),
+	_IsPoolReady:        (self: TrackWrapper) -> boolean,
 
 	_Track:          AnimationTrack?,
 	_CompletedConn:  RBXScriptConnection?,
@@ -112,7 +112,7 @@ TrackWrapper.__index = TrackWrapper
             A new wrapper in the stopped, zero-weight state, ready for _Play.
 ]=]
 function TrackWrapper.new(Config: AnimationConfig, Track: AnimationTrack?): TrackWrapper
-	local Self = setmetatable({
+	local self = setmetatable({
 		Config          = Config,
 		-- EffectiveWeight starts at 0. It is pushed up by _SetEffectiveWeight once
 		-- the wrapper is active and FadeInTime begins accumulating.
@@ -139,23 +139,23 @@ function TrackWrapper.new(Config: AnimationConfig, Track: AnimationTrack?): Trac
 	-- OR when :Stop() is called (regardless of looped state). We gate on `not Config.Looped`
 	-- so looped animations never fire CompletedSignal naturally — they require a manual Stop.
 	if not IS_SERVER and Track then
-		Self._CompletedConn = Track.Stopped:Connect(function()
-			local IsNaturalCompletion = Self.IsPlaying and not Config.Looped
+		self._CompletedConn = Track.Stopped:Connect(function()
+			local IsNaturalCompletion = self.IsPlaying and not Config.Looped
 			if IsNaturalCompletion then
-				Self.IsPlaying = false
+				self.IsPlaying = false
 				-- Setting TargetWeight to 0 marks this wrapper for retirement.
 				-- _PushWeights computes ComputeFinalWeight → 0, then calls _RetireWrapper
 				-- once EffectiveWeight also reaches 0 via the fade-out lerp.
 				-- Without this assignment, TargetWeight stays at Config.Weight and the
 				-- wrapper never gets retired — it stays in ActiveWrappers indefinitely,
 				-- leaking memory and blocking future plays of the same animation.
-				Self.TargetWeight = 0
-				Self.CompletedSignal:Fire()
+				self.TargetWeight = 0
+				self.CompletedSignal:Fire()
 			end
 		end)
 	end
 
-	return Self :: any
+	return self :: any
 end
 
 -- ─── Internal Mutation API ────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ end
 
     Notes:
         Bug #18 fix: _PlayGeneration is incremented BEFORE the task.delay is scheduled
-        so the closure captures the NEW generation. Any previously scheduled delay
+        so the closure captures the new generation. Any previously scheduled delay
         captures an older generation and will no-op when it fires.
 
         The bookkeeping update (IsPlaying, IsFading, StartTimestamp) happens before the

@@ -84,7 +84,7 @@ local MAX_POOL_SIZE_PER_CONFIG = 2
 
 --[[
     ControllerConfig is the complete set of parameters required to initialize a
-    fully functional AnimationController. All fields are validated during New.
+    fully functional AnimationController. All fields are validated during new.
 
     Fields:
         CharacterId    — Unique identifier used by replication to route intents and
@@ -126,7 +126,7 @@ AnimationController.__index = AnimationController
 -- ─── Constructor ──────────────────────────────────────────────────────────────
 
 --[=[
-    AnimationController.New
+    AnimationController.new
 
     Description:
         Constructs a fully initialized AnimationController for a single character.
@@ -144,7 +144,7 @@ AnimationController.__index = AnimationController
             immediately after construction.
 
     Notes:
-        AnimationRegistry must be initialized before calling New. The registry is
+        AnimationRegistry must be initialized before calling new. The registry is
         a singleton shared across all controllers on the same machine; the controller
         reads from it on every play request to look up AnimationConfig records.
 
@@ -154,7 +154,7 @@ AnimationController.__index = AnimationController
         happen in the same frame that is being composited — preventing a one-frame
         visual lag. The server uses Heartbeat because it never renders.
 ]=]
-function AnimationController.New(Config: ControllerConfig): any
+function AnimationController.new(Config: ControllerConfig): any
 	local Registry = AnimationRegistry.GetInstance()
 	assert(
 		Registry:IsInitialized(),
@@ -171,7 +171,7 @@ function AnimationController.New(Config: ControllerConfig): any
 		)
 	end
 
-	local Self = setmetatable({
+	local self = setmetatable({
 		CharacterId  = Config.CharacterId,
 		-- Only store the Animator on clients. The server explicitly receives nil
 		-- so that any code path that accidentally calls LoadAnimation on the server
@@ -179,7 +179,7 @@ function AnimationController.New(Config: ControllerConfig): any
 		Animator     = IS_SERVER and nil or Config.Animator,
 		IsDestroyed  = false,
 
-		-- Subsystems are populated below after Self is constructed.
+		-- Subsystems are populated below after self is constructed.
 		LayerManager = nil,
 		GroupManager = nil,
 		StateMachine = nil,
@@ -205,7 +205,7 @@ function AnimationController.New(Config: ControllerConfig): any
 	-- ── Build LayerManager ──────────────────────────────────────────────────
 	-- LayerManager is stateless beyond its layer records and active track lists.
 	-- Constructed first because other subsystems reference it.
-	Self.LayerManager = LayerManager.new(Config.LayerProfiles)
+	self.LayerManager = LayerManager.new(Config.LayerProfiles)
 
 	-- ── Build ExclusiveGroupManager ─────────────────────────────────────────
 	-- Two callbacks are wired into GroupManager so it can notify the controller
@@ -220,20 +220,20 @@ function AnimationController.New(Config: ControllerConfig): any
 	--     NOTE: _RetireWrapper cannot be used here — it looks up wrappers via
 	--     ActiveWrappers, but pending wrappers are never in ActiveWrappers. Using
 	--     _RetireWrapper would silently no-op, leaking the wrapper.
-	Self.GroupManager = ExclusiveGroupManager.new(
+	self.GroupManager = ExclusiveGroupManager.new(
 		function(GroupName: string, PendingWrapper: any)
-			Self:_OnPendingReady(GroupName, PendingWrapper)
+			self:_OnPendingReady(GroupName, PendingWrapper)
 		end,
 		function(DiscardedWrapper: any)
 			-- Bug V fix: pool rather than hard-destroy so pool capacity is preserved
 			-- across snapshot reconciliation cycles.
 			local ConfigName = DiscardedWrapper.Config.Name
 
-			if not Self._WrapperPool[ConfigName] then
-				Self._WrapperPool[ConfigName] = {}
+			if not self._WrapperPool[ConfigName] then
+				self._WrapperPool[ConfigName] = {}
 			end
 
-			local Pool = Self._WrapperPool[ConfigName]
+			local Pool = self._WrapperPool[ConfigName]
 			local IsPoolBelowCapacity = #Pool < MAX_POOL_SIZE_PER_CONFIG
 			local IsWrapperSafeToPool = DiscardedWrapper:_IsPoolReady()
 
@@ -251,28 +251,28 @@ function AnimationController.New(Config: ControllerConfig): any
 	-- animation directives. It is called inside _DoTransition after _CurrentState
 	-- has already been updated (Bug U fix), so GetCurrentStateName within the
 	-- callback returns the entering state's name.
-	Self.StateMachine = StateMachine.New(
+	self.StateMachine = StateMachine.new(
 		Config.States,
 		Config.InitialState,
 		Config.Predicates,
 		function(ExitingState: StateDefinition, EnteringState: StateDefinition)
-			Self:_OnStateChange(ExitingState, EnteringState)
+			self:_OnStateChange(ExitingState, EnteringState)
 		end
 	)
 
 	-- ── Build ReplicationBridge ─────────────────────────────────────────────
 	-- Bug #7 fix: the OnSnapshotMismatch callback is correctly passed and stored
-	-- inside ReplicationBridge.New (the original had the parameter but lost it).
-	Self._Replication = ReplicationBridge.New(
+	-- inside ReplicationBridge.new (the original had the parameter but lost it).
+	self._Replication = ReplicationBridge.new(
 		Config.CharacterId,
 		Config.IntentRemote,
 		Config.SnapshotRemote,
 		Config.IsOwningClient,
 		function(ReceivedIntent: Types.AnimationIntent)
-			Self:_OnIntentReceived(ReceivedIntent)
+			self:_OnIntentReceived(ReceivedIntent)
 		end,
 		function(MismatchedSnapshot: any)
-			Self:_OnSnapshotMismatch(MismatchedSnapshot)
+			self:_OnSnapshotMismatch(MismatchedSnapshot)
 		end
 	)
 
@@ -281,11 +281,11 @@ function AnimationController.New(Config: ControllerConfig): any
 	-- Clients use RenderStepped (fires before each frame is composited) so weight
 	-- adjustments are visible in the same frame they are computed — no visual lag.
 	local UpdateEvent = IS_SERVER and RunService.Heartbeat or RunService.RenderStepped
-	Self._FrameConn = UpdateEvent:Connect(function(DeltaTime: number)
-		Self:_Tick(DeltaTime)
+	self._FrameConn = UpdateEvent:Connect(function(DeltaTime: number)
+		self:_Tick(DeltaTime)
 	end)
 
-	return Self
+	return self
 end
 
 -- ─── Per-Frame Pipeline ───────────────────────────────────────────────────────
@@ -909,8 +909,8 @@ function AnimationController:_ExecutePlayRequest(ConfigName: string)
 			self:Stop(IncumbentWrapper.Config.Name, false)
 		end
 
-		local NewWrapper = self:_AcquireWrapper(Config)
-		self:_ActivateWrapper(NewWrapper, Config, LayerRecord)
+		local newWrapper = self:_AcquireWrapper(Config)
+		self:_ActivateWrapper(newWrapper, Config, LayerRecord)
 	end
 	-- REJECT: incoming animation lost conflict resolution; do nothing.
 end
@@ -1507,7 +1507,7 @@ end
 ]=]
 function AnimationController:AttachInspector(): any
 	local DebugInspector = require(script.DebugInspector)
-	return DebugInspector.New(self)
+	return DebugInspector.new(self)
 end
 
 -- ─── Destruction ──────────────────────────────────────────────────────────────
