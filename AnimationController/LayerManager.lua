@@ -235,4 +235,3 @@ function LayerManager:ValidateInvariants(activeWrappers: { [string]: any }?): { 
 end
 
 return LayerManager
-return LayerManager

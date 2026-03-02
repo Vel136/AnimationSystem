@@ -335,9 +335,15 @@ function AnimationController:Stop(animationName: string, immediate: boolean?)
 end
 
 function AnimationController:StopGroup(groupName: string, immediate: boolean?)
-	-- Bug #17 fix: collect wrapper names first, then stop, to avoid any
-	-- concern about iterating ActiveWrappers while Stop indirectly modifies it
-	-- (currently Stop does not mutate the table, but this is defensive and clear).
+	local registry = AnimationRegistry.GetInstance()
+	-- Cancel pending queue entries for any animation in this group
+	for i = #self.PendingQueue, 1, -1 do
+		local cfg = registry:GetByName(self.PendingQueue[i].ConfigName)
+		if cfg and cfg.Group == groupName then
+			table.remove(self.PendingQueue, i)
+		end
+	end
+	-- Stop currently active wrappers
 	local toStop: { string } = {}
 	for name, wrapper in self.ActiveWrappers do
 		if wrapper.Config.Group == groupName then
@@ -348,7 +354,6 @@ function AnimationController:StopGroup(groupName: string, immediate: boolean?)
 		self:Stop(name, immediate)
 	end
 end
-
 -- ── Pending Queue Flush ────────────────────────────────────────────────────
 
 function AnimationController:_FlushPendingQueue()
@@ -487,8 +492,8 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 	if verdict == "ALLOW" then
 		-- Stop all incumbents on this layer, not just the strongest.
 		for _, incumbent in layerIncumbents do
-			incumbent:_Stop(false)
-		end
+        self:Stop(incumbent.Config.Name, false)
+    end
 		local wrapper = self:_AcquireWrapper(config)
 		self:_ActivateWrapper(wrapper, config, layerRecord)
 	end
