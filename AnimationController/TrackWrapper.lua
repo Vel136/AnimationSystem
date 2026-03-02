@@ -84,6 +84,10 @@ function TrackWrapper.new(config: AnimationConfig, track: AnimationTrack?): Trac
 		self._completedConn = track.Stopped:Connect(function()
 			if self.IsPlaying and not config.Looped then
 				self.IsPlaying = false
+				-- Fix: set TargetWeight = 0 so _PushWeights can reach EffectiveWeight == 0
+				-- and retire this wrapper. Without this, naturally-completed animations
+				-- stay in ActiveWrappers indefinitely and block new plays on the same layer.
+				self.TargetWeight = 0
 				self.CompletedSignal:Fire()
 			end
 		end)
@@ -127,6 +131,9 @@ function TrackWrapper:_Play()
 				if self._playGeneration ~= capturedGeneration then return end
 				if self.IsPlaying then
 					self.IsPlaying = false
+					-- Fix: set TargetWeight = 0 so _PushWeights can reach EffectiveWeight == 0
+					-- and retire this wrapper. Mirrors the same fix in the _completedConn path.
+					self.TargetWeight = 0
 					self.CompletedSignal:Fire()
 				end
 			end)
@@ -140,21 +147,46 @@ end
 function TrackWrapper:_Stop(immediate: boolean)
 	if self._destroyed then return end
 
-	-- Bug #4 fix: only set IsFading when the wrapper is currently playing.
-	-- Previously IsFading was set unconditionally, which caused wrappers that
-	-- had never been played (or had already finished) to enter a perpetual
-	-- fading state, preventing _PushWeights from ever retiring them.
-	self.IsPlaying = false
-	if self.IsPlaying then
-		-- This branch is now unreachable given the line above, but left as
-		-- documentation: IsFading is only meaningful when transitioning out
-		-- of an active play cycle.
-	end
-	self.IsFading     = (not immediate) and self.IsPlaying and self.Config.FadeOutTime > 0
+	-- Bug #4 fix: only set IsFading when the wrapper was actually playing.
+	-- Capture wasPlaying before clearing IsPlaying so the IsFading assignment
+	-- can reference it. The original fix accidentally set IsFading using
+	-- self.IsPlaying after it had already been set to false, making IsFading
+	-- always false and silently breaking all fade-out behaviour.
+	local wasPlaying  = self.IsPlaying
+	self.IsPlaying    = false
+	self.IsFading     = wasPlaying and (not immediate) and self.Config.FadeOutTime > 0
 	self.TargetWeight = 0
 
 	if immediate then
 		self.EffectiveWeight = 0
+	end
+
+	-- CompletedSignal must fire for every faded manual stop so group slot promotion
+	-- and other CompletedSignal listeners run correctly. There are three separate
+	-- completion paths and none covers all cases on its own:
+	--
+	--   1. _completedConn (track.Stopped): fires only when `IsPlaying` is still true
+	--      at the moment track.Stopped fires. For NATURAL completion this works —
+	--      the track plays to the end and stops while IsPlaying=true. For MANUAL
+	--      faded stop it does NOT fire because _Stop already set IsPlaying=false
+	--      before track.Stopped fires.
+	--
+	--   2. Server task.delay in _Play: fires only on NATURAL non-looped completion.
+	--      Does not fire when _Stop is called manually.
+	--
+	--   3. This deferred fire: covers all MANUAL faded stops on both environments.
+	--      Gated on `not immediate` because immediate stops are handled synchronously
+	--      in Stop()'s isImmediate branch (OnActiveCompleted called directly), and
+	--      firing here too would cause a double OnActiveCompleted call.
+	--
+	-- Bug B, Q fixes: server path. Bug X fix: client path (both looped and non-looped).
+	if wasPlaying and not immediate then
+		local capturedGeneration = self._playGeneration
+		task.defer(function()
+			if self._destroyed then return end
+			if self._playGeneration ~= capturedGeneration then return end
+			self.CompletedSignal:Fire()
+		end)
 	end
 
 	-- Only interact with the real track on the client.
@@ -178,8 +210,25 @@ function TrackWrapper:_SetEffectiveWeight(w: number)
 		self._track:AdjustWeight(clamped)
 	end
 
-	if clamped == 0 and self.IsFading then
-		self.IsFading = false
+	-- IsFading is true during both fade-in and fade-out transitions.
+	-- _Play only sets IsFading=true when FadeInTime > 0, so IsFading=true while
+	-- IsPlaying always means a fade-in is in progress.
+	-- Clear conditions:
+	--   • Fade-out complete: weight reaches 0
+	--   • Fade-in complete: elapsed time since play start >= FadeInTime
+	-- EffectiveWeight cannot be compared against TargetWeight to detect fade-in
+	-- completion because EffectiveWeight is layer-modulated
+	-- (LayerCurrentWeight × TargetWeight × ConfigWeight) while TargetWeight is
+	-- the raw wrapper weight — different scales, not reliably comparable.
+	if self.IsFading then
+		if clamped == 0 then
+			self.IsFading = false
+		elseif self.IsPlaying then
+			-- Fade-in: clear once FadeInTime has elapsed.
+			if os.clock() - self.StartTimestamp >= self.Config.FadeInTime then
+				self.IsFading = false
+			end
+		end
 	end
 end
 
@@ -217,6 +266,7 @@ function TrackWrapper:_Reinitialize()
 		self._completedConn = self._track.Stopped:Connect(function()
 			if self.IsPlaying and not self.Config.Looped then
 				self.IsPlaying = false
+				self.TargetWeight = 0
 				self.CompletedSignal:Fire()
 			end
 		end)

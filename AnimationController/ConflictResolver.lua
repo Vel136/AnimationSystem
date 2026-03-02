@@ -101,14 +101,15 @@ function ConflictResolver.Resolve(input: ResolverInput): ConflictVerdict
 	end
 
 	-- ── Phase 4: Timestamp ───────────────────────────────────────────────
-	-- Bug #20 fix: ActiveTimestamp was accepted and documented but never read.
-	-- The more recently started animation wins ties; exact same timestamp → REJECT
-	-- (incumbent holds, which is the correct conservative default).
-	local incomingTime = input.Now or os.clock()
-	local activeTime   = input.ActiveTimestamp or 0
-	if incomingTime > activeTime then
-		return "ALLOW"
-	end
+	-- Bug #20 fix introduced a subtler bug: input.Now is os.clock() at resolution
+	-- time, which is always greater than activeTime (the active animation's
+	-- StartTimestamp set when it began playing). So the incoming animation always
+	-- wins Phase 4, making it effectively unconditional ALLOW — the tiebreaker
+	-- was meaningless. Phases 1–3 have already compared layer order and priority;
+	-- reaching Phase 4 means both animations are equal on every meaningful axis.
+	-- The correct conservative default is REJECT: the incumbent holds.
+	-- A genuine "newer request wins" tiebreaker would require an IncomingTimestamp
+	-- on the request itself, which the current data model does not provide.
 	return "REJECT"
 end
 

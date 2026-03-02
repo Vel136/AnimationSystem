@@ -33,6 +33,9 @@ export type StateMachine = typeof(setmetatable({} :: {
 	_transitionTime     : number,
 	_onStateChange      : ((exitState: StateDefinition, enterState: StateDefinition) -> ())?,
 	_terminalStates     : { [string]: boolean },
+	-- Bug H fix: pre-sorted transition lists keyed by state name, built once in
+	-- _ValidateGraph. Eliminates the table.clone + table.sort allocation every tick.
+	_sortedTransitions  : { [string]: { TransitionRule } },
 }, StateMachine))
 
 -- onStateChange: callback to AnimationController that dispatches directives and layer diffs.
@@ -51,6 +54,7 @@ function StateMachine.new(
 		_transitionTime     = os.clock(),
 		_onStateChange      = onStateChange,
 		_terminalStates     = {},
+		_sortedTransitions  = {},
 	}, StateMachine)
 
 	-- Index states by name
@@ -89,6 +93,12 @@ function StateMachine:_ValidateGraph()
 			table.insert(statesWithNoOutgoing, name)
 			self._terminalStates[name] = true
 		end
+
+		-- Bug H fix: build a pre-sorted copy of each state's transition list once
+		-- at init time so Tick can iterate a sorted array without allocating per frame.
+		local sorted = table.clone(state.Transitions)
+		table.sort(sorted, function(a, b) return a.Priority > b.Priority end)
+		self._sortedTransitions[name] = sorted
 	end
 
 	if #statesWithNoOutgoing > 0 then
@@ -114,7 +124,11 @@ function StateMachine:Tick()
 	-- First, process any externally queued transitions (from RequestTransition).
 	if #self._pendingTransitions > 0 then
 		-- Sort descending by priority, take the highest.
-		table.sort(self._pendingTransitions, function(a, b) return a.Priority > b.Priority end)
+		-- Bug W fix: skip the sort when there is only one entry — table.sort on a
+		-- single-element array still allocates an internal sort buffer every tick.
+		if #self._pendingTransitions > 1 then
+			table.sort(self._pendingTransitions, function(a, b) return a.Priority > b.Priority end)
+		end
 		local best = self._pendingTransitions[1]
 		-- Bug #8 fix: clear the queue AFTER a successful transition, not before.
 		-- If _DoTransition asserts, the pending request is preserved and can be
@@ -128,15 +142,10 @@ function StateMachine:Tick()
 	local currentState = self._states[self._currentState]
 	if not currentState or #currentState.Transitions == 0 then return end
 
-	-- Bug #16 fix: sort a copy of the transitions descending by priority so
-	-- predicates are evaluated in strict priority order. The original loop
-	-- used `> bestPriority` to skip lower-priority candidates, but this caused
-	-- equal-priority rules to be resolved purely by iteration order without
-	-- evaluating all of their predicates. By sorting first and scanning linearly,
-	-- we guarantee the highest-priority true predicate always wins, and all
-	-- predicates at equal priority levels are evaluated fairly.
-	local sorted: { TransitionRule } = table.clone(currentState.Transitions)
-	table.sort(sorted, function(a, b) return a.Priority > b.Priority end)
+	-- Bug H fix: use the pre-sorted transition list built at init time in _ValidateGraph.
+	-- Previously this did table.clone + table.sort every tick, allocating a new table
+	-- every frame for every active state machine regardless of whether a transition fired.
+	local sorted = self._sortedTransitions[self._currentState]
 
 	local bestTransition: TransitionRule? = nil
 
@@ -166,17 +175,26 @@ end
 -- ── Transition Execution ───────────────────────────────────────────────────
 
 function StateMachine:_DoTransition(toStateName: string)
+	-- Fix: self-transitions silently replay all ExitActions then EntryActions for the
+	-- same state, stopping animations that should keep playing. No-op if already there.
+	if toStateName == self._currentState then return end
+
 	local fromState = self._states[self._currentState]
 	local toState   = self._states[toStateName]
 
 	assert(toState, string.format("[StateMachine] Transition target '%s' not defined", toStateName))
 
+	-- Bug U fix: update _currentState BEFORE firing _onStateChange so that any
+	-- code running inside the callback (e.g. _ActivateWrapper calling
+	-- GetCurrentStateName for QueueIntent's StateContext) sees the new state, not
+	-- the old one. Previously the assignment came after the callback, meaning every
+	-- intent queued during entry actions was tagged with the exiting state name.
+	self._currentState   = toStateName
+	self._transitionTime = os.clock()
+
 	if self._onStateChange then
 		self._onStateChange(fromState, toState)
 	end
-
-	self._currentState   = toStateName
-	self._transitionTime = os.clock()
 end
 
 -- External systems (combat, movement) may queue a transition for next tick.

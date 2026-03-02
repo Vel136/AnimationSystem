@@ -89,9 +89,28 @@ function AnimationController.new(cfg: ControllerConfig): any
 	-- Build subsystems
 	self.LayerManager = LayerManager.new(cfg.LayerProfiles)
 
-	self.GroupManager = ExclusiveGroupManager.new(function(groupName: string, wrapper: any)
-		self:_OnPendingReady(groupName, wrapper)
-	end)
+	self.GroupManager = ExclusiveGroupManager.new(
+		function(groupName: string, wrapper: any)
+			self:_OnPendingReady(groupName, wrapper)
+		end,
+		-- Bug V fix: pool or destroy discarded pending wrappers directly.
+		-- _RetireWrapper cannot be used here — it looks up the wrapper via
+		-- ActiveWrappers, but pending wrappers are never in ActiveWrappers,
+		-- so it would silently no-op and leak the wrapper.
+		function(wrapper: any)
+			local configName = wrapper.Config.Name
+			if not self._wrapperPool[configName] then
+				self._wrapperPool[configName] = {}
+			end
+			local pool = self._wrapperPool[configName]
+			if #pool < MAX_POOL_SIZE_PER_CONFIG and wrapper:_IsPoolReady() then
+				wrapper.CompletedSignal:DisconnectAll()
+				table.insert(pool, wrapper)
+			else
+				wrapper:_Destroy()
+			end
+		end
+	)
 
 	self.StateMachine = StateMachine.new(
 		cfg.States,
@@ -141,7 +160,13 @@ function AnimationController:_Tick(dt: number)
 	-- Step 2: LayerManager smoothly interpolates layer weights
 	self.LayerManager:UpdateWeights(dt)
 
-	-- Step 3: Push computed weights down to all active TrackWrappers
+	-- Step 3: Push computed weights down to all active TrackWrappers.
+	-- Bug fix: _PushWeights must run unconditionally every tick, not gated on
+	-- whether layer weights changed. _PushWeights is also the wrapper retirement
+	-- pump — it zeroes EffectiveWeight and calls _RetireWrapper for wrappers whose
+	-- IsPlaying/IsFading flags were cleared (e.g. by natural track completion or
+	-- _Stop). If layers are settled (weightsChanged=false) those wrappers would
+	-- accumulate in ActiveWrappers and LayerManager.ActiveTracks indefinitely.
 	self:_PushWeights()
 
 	-- Step 4: Flush ReplicationBridge
@@ -182,6 +207,23 @@ function AnimationController:_RetireWrapper(configName: string)
 	if not wrapper then return end
 
 	self.LayerManager:UnregisterTrack(wrapper.Config.Layer, wrapper)
+
+	-- Bug B fix: if this wrapper was the active wrapper for a group, proactively
+	-- clear the group slot and promote any pending wrapper.
+	-- The deferred CompletedSignal:Fire() from _Stop(false) will fire AFTER
+	-- _RetireWrapper (task.defer runs after the current tick's thread), by which
+	-- point DisconnectAll has already removed the Once/Connect listener that was
+	-- supposed to call OnActiveCompleted. Without this call, the group slot stays
+	-- occupied by the now-retired (possibly reused) wrapper indefinitely.
+	-- Guard: only fire if ActiveWrapper still points to THIS wrapper, so we don't
+	-- double-fire for natural completions (where the Connect listener already called
+	-- OnActiveCompleted and updated the slot before we get here).
+	if wrapper.Config.Group then
+		local record = self.GroupManager._groups[wrapper.Config.Group]
+		if record and record.ActiveWrapper == wrapper then
+			self.GroupManager:OnActiveCompleted(wrapper.Config.Group)
+		end
+	end
 
 	if not self._wrapperPool[configName] then
 		self._wrapperPool[configName] = {}
@@ -244,6 +286,15 @@ end
 -- ── Public Stop API ───────────────────────────────────────────────────────
 
 function AnimationController:Stop(animationName: string, immediate: boolean?)
+	-- Fix: cancel any pending queued play for this animation so a Stop issued in the
+	-- same frame (e.g. from a state transition ExitAction) is not undone by a queued
+	-- Play that _FlushPendingQueue will execute at Step 5.
+	for i = #self.PendingQueue, 1, -1 do
+		if self.PendingQueue[i].ConfigName == animationName then
+			table.remove(self.PendingQueue, i)
+		end
+	end
+
 	local wrapper = self.ActiveWrappers[animationName]
 	if not wrapper then return end
 
@@ -259,13 +310,22 @@ function AnimationController:Stop(animationName: string, immediate: boolean?)
 			-- but does NOT promote a pending wrapper. OnActiveCompleted handles both.
 			self.GroupManager:OnActiveCompleted(group)
 		else
-			-- Faded stop: wait until the fade has fully played out (EffectiveWeight reaches 0
-			-- in _PushWeights → _RetireWrapper) before promoting a pending wrapper.
-			-- We listen on CompletedSignal which fires when IsPlaying flips to false.
-			-- Bug #5 original issue: ClearActive was used here too, which skipped promotion.
-			wrapper.CompletedSignal:Once(function()
-				self.GroupManager:OnActiveCompleted(group)
-			end)
+			-- Faded stop: promote when the fade completes.
+			-- For LOOPED grouped animations, _ActivateWrapper does not connect
+			-- CompletedSignal (looped anims never complete naturally), so we must
+			-- connect Once here to handle manual stop promotion.
+			-- For NON-LOOPED grouped animations, _ActivateWrapper already has a
+			-- permanent Connect on CompletedSignal that fires on both natural AND
+			-- manual completion. Adding a Once here as well causes OnActiveCompleted
+			-- to be called TWICE on manual stop — the second call clears the group
+			-- slot that was just assigned to the newly promoted wrapper.
+			if wrapper.Config.Looped then
+				wrapper.CompletedSignal:Once(function()
+					self.GroupManager:OnActiveCompleted(group)
+				end)
+			end
+			-- Non-looped: the Connect from _ActivateWrapper fires CompletedSignal
+			-- and calls OnActiveCompleted exactly once, covering the manual stop path.
 		end
 	end
 
@@ -325,8 +385,11 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 	-- overwrite ActiveWrappers[configName], orphaning the fading wrapper — it would
 	-- remain registered in LayerManager.ActiveTracks indefinitely with no reference
 	-- in ActiveWrappers for _PushWeights to ever retire it.
+	-- Bug A fix: nil existing after retiring so the incumbent search below does not
+	-- compare against a dangling reference that is no longer in ActiveWrappers.
 	if existing then
 		self:_RetireWrapper(configName)
+		existing = nil
 	end
 
 	-- ── Grouped path ──────────────────────────────────────────────────────
@@ -391,30 +454,41 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 	end
 
 	-- ── Non-grouped path ──────────────────────────────────────────────────
-	local incumbentWrapper: any = nil
+	-- Bug E fix: the original code found only the single strongest incumbent and
+	-- tested the incoming animation against it. If the incoming animation won, weaker
+	-- incumbents on the same layer were never stopped and accumulated indefinitely.
+	-- The fix collects ALL non-grouped wrappers on the same layer, resolves against
+	-- the strongest one (correct authority), and if ALLOW, stops all of them.
+	local layerIncumbents: { any } = {}
+	local strongestIncumbent: any = nil
 	for _, wrapper in self.ActiveWrappers do
-		if wrapper.Config.Layer == config.Layer and wrapper ~= existing then
-			if incumbentWrapper == nil or wrapper.Config.Priority > incumbentWrapper.Config.Priority then
-				incumbentWrapper = wrapper
+		if wrapper.Config.Layer == config.Layer and wrapper.Config.Group == nil then
+			table.insert(layerIncumbents, wrapper)
+			if strongestIncumbent == nil or wrapper.Config.Priority > strongestIncumbent.Config.Priority then
+				strongestIncumbent = wrapper
 			end
 		end
 	end
 
 	local verdict: Types.ConflictVerdict
-	if incumbentWrapper then
-		local incumbentLayer = self.LayerManager:GetLayer(incumbentWrapper.Config.Layer)
+	if strongestIncumbent then
+		local incumbentLayer = self.LayerManager:GetLayer(strongestIncumbent.Config.Layer)
 		verdict = ConflictResolver.ResolveNoGroup(
 			config,
 			layerRecord.Order,
-			incumbentWrapper.Config,
+			strongestIncumbent.Config,
 			incumbentLayer and incumbentLayer.Order or 0,
-			incumbentWrapper.StartTimestamp
+			strongestIncumbent.StartTimestamp
 		)
 	else
 		verdict = "ALLOW"
 	end
 
 	if verdict == "ALLOW" then
+		-- Stop all incumbents on this layer, not just the strongest.
+		for _, incumbent in layerIncumbents do
+			incumbent:_Stop(false)
+		end
 		local wrapper = self:_AcquireWrapper(config)
 		self:_ActivateWrapper(wrapper, config, layerRecord)
 	end
@@ -427,8 +501,19 @@ function AnimationController:_ActivateWrapper(wrapper: any, config: AnimationCon
 	self.LayerManager:RegisterTrack(config.Layer, wrapper)
 
 	if not config.Looped and config.Group then
+		-- Fix: capture the wrapper reference so that if this wrapper is later interrupted
+		-- by a new animation in the same group, its deferred CompletedSignal fire doesn't
+		-- clear the NEW wrapper's group slot. Without this capture, the Connect closure
+		-- closes over 'wrapper' by reference — but since the same variable is reused the
+		-- slot ends up being cleared immediately after the new animation is assigned,
+		-- breaking mutual exclusivity.
+		local capturedWrapper = wrapper
+		local capturedGroup   = config.Group :: string
 		wrapper.CompletedSignal:Connect(function()
-			self.GroupManager:OnActiveCompleted(config.Group :: string)
+			local record = self.GroupManager._groups[capturedGroup]
+			if record and record.ActiveWrapper == capturedWrapper then
+				self.GroupManager:OnActiveCompleted(capturedGroup)
+			end
 		end)
 	end
 
@@ -448,6 +533,10 @@ end
 function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
 	if self.IsDestroyed then
 		wrapper:_Destroy()
+		-- Bug I fix: OnActiveCompleted no longer clears ActiveWrapper upfront.
+		-- On a failed promotion we must clear it here so the group slot doesn't
+		-- stay occupied by the just-completed (no longer playing) wrapper forever.
+		self.GroupManager:ClearActive(groupName)
 		return
 	end
 
@@ -461,6 +550,9 @@ function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
 	-- firing (e.g. a higher-priority play arrived and displaced it).
 	if record.PendingWrapper ~= wrapper then
 		wrapper:_Destroy()
+		-- Bug I fix: a mismatch means a newer pending wrapper displaced this one
+		-- before it could be promoted. ActiveWrapper should already be correctly
+		-- managed by the newer request path, so no ClearActive needed here.
 		return
 	end
 
@@ -468,13 +560,16 @@ function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
 	-- EvaluatePlayRequest. EvaluatePlayRequest inspects record.PendingWrapper to
 	-- determine what to evict. If we don't clear it first, it sees the incoming
 	-- wrapper as the pending occupant, returns it as PendingEvicted, and the
-	-- caller would then destroy the wrapper it is trying to promote.
+	-- caller would then destroy the wrapper it is trying to activate.
 	record.PendingWrapper = nil
 
 	local config      = wrapper.Config
 	local layerRecord = self.LayerManager:GetLayer(config.Layer)
 	if not layerRecord then
 		wrapper:_Destroy()
+		-- Bug I fix: layer lookup failed — promotion cannot proceed.
+		-- Clear the slot so the group is not permanently stuck on a dead wrapper.
+		self.GroupManager:ClearActive(groupName)
 		return
 	end
 
@@ -489,8 +584,19 @@ function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
 			result.PendingEvicted:_Destroy()
 		end
 		self:_ActivateWrapper(wrapper, config, layerRecord)
+	elseif result.Verdict == "DEFER" then
+		-- Fix: a new CanInterrupt=false animation started in this group between the
+		-- timer firing and this re-evaluation. EvaluatePlayRequest has re-stored
+		-- 'wrapper' as record.PendingWrapper and scheduled a new timer. Do NOT
+		-- destroy the wrapper (it is still owned as pending) and do NOT call
+		-- ClearActive (the new animation is correctly the active wrapper).
+		return
 	else
+		-- REJECT verdict
 		wrapper:_Destroy()
+		-- REJECT verdict — EvaluatePlayRequest did not commit a new ActiveWrapper,
+		-- so clear the slot ourselves.
+		self.GroupManager:ClearActive(groupName)
 	end
 end
 
@@ -544,6 +650,17 @@ function AnimationController:_OnStateChange(exitState: StateDefinition, enterSta
 		end
 	end
 
+	-- Bug R fix: deactivate layers that were active in the exiting state but are
+	-- neither active nor suppressed in the entering state. Without this loop, a
+	-- layer activated by a state is never cleaned up when transitioning to a state
+	-- that doesn't reference it — it stays at its raised weight indefinitely,
+	-- with no state owning it, accumulating across transitions.
+	for name in exitActive do
+		if not enterActive[name] and not enterSuppress[name] then
+			self.LayerManager:SetLayerToBase(name)
+		end
+	end
+
 	for _, directive in enterState.EntryActions do
 		self:_DispatchDirective(directive)
 	end
@@ -587,14 +704,46 @@ end
 function AnimationController:_OnSnapshotMismatch(snapshot: any)
 	if self.IsDestroyed then return end
 
-	-- Stop everything currently playing so we start from a clean slate.
+	-- Stop and destroy all active wrappers immediately.
+	-- Fix: call UnregisterTrack before destroying so LayerManager.ActiveTracks does not
+	-- accumulate stale entries that corrupt DebugInspector output and ValidateInvariants.
 	for name, wrapper in self.ActiveWrappers do
+		self.LayerManager:UnregisterTrack(wrapper.Config.Layer, wrapper)
 		wrapper:_Stop(true)
-		if wrapper.Config.Group then
-			self.GroupManager:ClearActive(wrapper.Config.Group)
-		end
+		wrapper:_Destroy()
 	end
 	table.clear(self.ActiveWrappers)
+
+	-- Bug D fix: clear any play requests that were queued earlier this tick.
+	-- Without this, stale requests flush in step 5 alongside the reconciliation
+	-- plays and can immediately overwrite the snapshot-dictated state.
+	table.clear(self.PendingQueue)
+
+	-- Tear down and rebuild GroupManager so that pending wrappers in any group
+	-- are destroyed and group records are cleared. Using ClearActive alone would
+	-- leave pending wrappers orphaned with no path to ever be promoted or destroyed.
+	self.GroupManager:Destroy()
+	self.GroupManager = ExclusiveGroupManager.new(
+		function(groupName: string, wrapper: any)
+			self:_OnPendingReady(groupName, wrapper)
+		end,
+		-- Bug V fix: pool or destroy discarded pending wrappers directly.
+		-- _RetireWrapper cannot be used here — pending wrappers are never in
+		-- ActiveWrappers so it would silently no-op and leak the wrapper.
+		function(wrapper: any)
+			local configName = wrapper.Config.Name
+			if not self._wrapperPool[configName] then
+				self._wrapperPool[configName] = {}
+			end
+			local pool = self._wrapperPool[configName]
+			if #pool < MAX_POOL_SIZE_PER_CONFIG and wrapper:_IsPoolReady() then
+				wrapper.CompletedSignal:DisconnectAll()
+				table.insert(pool, wrapper)
+			else
+				wrapper:_Destroy()
+			end
+		end
+	)
 
 	-- Reconcile state machine if it diverged.
 	if snapshot.StateName and snapshot.StateName ~= self.StateMachine:GetCurrentStateName() then
@@ -623,6 +772,15 @@ function AnimationController:_BuildActiveGroupAnimMap(): { [string]: string }
 	local map = {}
 	for _, wrapper in self.ActiveWrappers do
 		if wrapper.Config.Group and wrapper.IsPlaying and not wrapper.IsFading then
+			-- Bug F fix: warn if two wrappers from the same group are both active,
+			-- which violates the exclusivity invariant. Last-write-wins so the map
+			-- stays consistent, but the warning surfaces the violation for debugging.
+			if map[wrapper.Config.Group] then
+				warn(string.format(
+					"[AnimationController] Group invariant violated: both '%s' and '%s' are active in group '%s'",
+					map[wrapper.Config.Group], wrapper.Config.Name, wrapper.Config.Group
+					))
+			end
 			map[wrapper.Config.Group] = wrapper.Config.Name
 		end
 	end
@@ -653,9 +811,12 @@ function AnimationController:Destroy()
 	end
 	table.clear(self.ActiveWrappers)
 
-	-- Bug #6 fix: use explicit key variable name for clarity.
+	-- Bug G fix: call _Stop(true) before _Destroy so that any wrapper that somehow
+	-- reached the pool while its underlying track was still fading gets stopped
+	-- cleanly rather than leaving a ghost track playing on the client until GC.
 	for configName, pool in self._wrapperPool do
 		for _, wrapper in pool do
+			wrapper:_Stop(true)
 			wrapper:_Destroy()
 		end
 	end

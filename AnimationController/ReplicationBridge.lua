@@ -113,7 +113,15 @@ function ReplicationBridge.new(
 			table.insert(self._connections, conn)
 		end
 
-		if snapshotRemote then
+		-- Bug P fix: the owning client must NOT subscribe to the snapshot remote.
+		-- The owning client is the animation authority for its own character — it
+		-- plays animations in response to its own input and sends intents to the
+		-- server. The server's snapshot reflects what the owning client told it,
+		-- with a delay. If the owning client subscribed, it would compare its
+		-- always-zero local sequence number against the server's ever-incrementing
+		-- one, trigger _OnSnapshotMismatch every 2.5 seconds, and wipe all its
+		-- correctly-playing animations. Only non-owning clients need reconciliation.
+		if not isOwningClient and snapshotRemote then
 			local conn = snapshotRemote.OnClientEvent:Connect(function(snapshot: any)
 				self:_HandleSnapshot(snapshot)
 			end)
@@ -127,9 +135,40 @@ end
 -- ── Intent Pooling ─────────────────────────────────────────────────────────
 
 function ReplicationBridge:_AcquireIntent(): AnimationIntent
-	local intent = self._intentPool[self._poolCursor]
-	self._poolCursor = (self._poolCursor % INTENT_POOL_SIZE) + 1
-	return intent
+	-- Bug S fix: pool slots written directly into _intentQueue (bug O fix) are
+	-- shared mutable objects. If QueueIntent is called enough times in one tick
+	-- to wrap the cursor before Flush drains the queue, the cursor lands on a slot
+	-- that is still in _intentQueue and overwrites it before it is sent.
+	-- Fix: scan forward from the current cursor position to find a slot that is
+	-- not currently queued. In the worst case (queue full) we fall back to a fresh
+	-- table allocation rather than corrupting an in-flight intent.
+	local startCursor = self._poolCursor
+	local size = INTENT_POOL_SIZE
+	for i = 0, size - 1 do
+		local idx = ((startCursor - 1 + i) % size) + 1
+		local slot = self._intentPool[idx]
+		-- Check whether this slot is already sitting in the queue.
+		local inFlight = false
+		for _, queued in self._intentQueue do
+			if queued == slot then
+				inFlight = true
+				break
+			end
+		end
+		if not inFlight then
+			self._poolCursor = (idx % size) + 1
+			return slot
+		end
+	end
+	-- All pool slots are in-flight (more QueueIntent calls than pool size in one tick).
+	-- Allocate a fresh table so we never corrupt queued intents.
+	return {
+		CharacterId   = "",
+		AnimationName = "",
+		Action        = "PLAY",
+		Timestamp     = 0,
+		StateContext  = "",
+	}
 end
 
 function ReplicationBridge:_RecycleIntent(_intent: AnimationIntent)
@@ -146,14 +185,26 @@ function ReplicationBridge:QueueIntent(
 	if self._destroyed then return end
 	if not self._isOwningClient then return end
 
+	-- Bug O fix: the original code acquired a pool slot, mutated it, then
+	-- immediately called table.clone to insert into the queue — allocating a new
+	-- table on every call and making the pool completely pointless. The pool was
+	-- designed to pre-allocate intent records and reuse them across frames.
+	-- Fix: write directly into the queue using a pre-allocated slot from the pool.
+	-- Flush consumes and clears the queue each tick, so pool slots are safe to
+	-- reuse once the queue is drained. We track queue size separately from the
+	-- pool cursor so concurrent calls within a tick each get their own slot.
 	local intent = self:_AcquireIntent()
 	intent.CharacterId   = self._characterId
 	intent.AnimationName = animationName
 	intent.Action        = action
-	intent.Timestamp     = os.clock()
+	-- Bug A fix: was os.clock() (process uptime), which is independent per machine.
+	-- Server's os.clock() and client's os.clock() have no relationship, making the
+	-- age calculation in _HandleClientIntent meaningless. workspace:GetServerTimeNow()
+	-- returns a synchronized timestamp on both client and server so the comparison is valid.
+	intent.Timestamp     = workspace:GetServerTimeNow()
 	intent.StateContext  = stateContext
 
-	table.insert(self._intentQueue, table.clone(intent))
+	table.insert(self._intentQueue, intent)
 end
 
 -- ── Per-Tick Flush ─────────────────────────────────────────────────────────
@@ -175,13 +226,22 @@ function ReplicationBridge:Flush(dt: number, currentStateName: string, activeGro
 		self._snapshotTimer += dt
 		if self._snapshotTimer >= SNAPSHOT_INTERVAL_S then
 			self._snapshotTimer = 0
-			self._sequenceNumber += 1
+			-- Bug fix: do NOT increment _sequenceNumber here. Snapshots are
+			-- checkpoints, not sequence events — only intents advance the counter.
+			-- The client mirrors the server's counter via _HandleIncomingIntent (+1
+			-- per relayed intent). If the server also bumps for each snapshot, the
+			-- client's counter is always 1 behind, so _HandleSnapshot sees
+			-- (snapshotSeq ~= prevSeq) as permanently true and fires
+			-- _onSnapshotMismatch every 2.5 seconds, wiping all correctly-playing
+			-- animations on every non-owning client. Broadcasting the current
+			-- (un-bumped) value means delta=0 on a clean round and delta=N on N
+			-- dropped intents, which is the intended behaviour.
 			self._snapshotRemote:FireAllClients({
 				CharacterId      = self._characterId,
 				StateName        = currentStateName,
 				ActiveGroupAnims = activeGroupAnims,
 				SequenceNumber   = self._sequenceNumber,
-				ServerTime       = os.clock(),
+				ServerTime       = workspace:GetServerTimeNow(),
 			})
 		end
 	end
@@ -193,7 +253,23 @@ function ReplicationBridge:_HandleClientIntent(player: Player, intent: Animation
 	if self._destroyed then return end
 	if intent.CharacterId ~= self._characterId then return end
 
-	local age = os.clock() - intent.Timestamp
+	-- Bug 5 fix: verify the sending player actually owns this character.
+	-- Without this, any client that knows another character's ID can drive
+	-- their animations. Check the player's Character's Name against CharacterId.
+	-- NOTE: This assumes CharacterId is set to the character's Instance Name
+	-- (typically the player's username in Roblox). If your game uses a different
+	-- scheme for CharacterId (e.g. UserId as string, or a GUID), update this
+	-- check accordingly to match your identity convention.
+	local character = player.Character
+	if not character or character.Name ~= self._characterId then
+		warn(string.format(
+			"[ReplicationBridge] Rejected intent from %s for character '%s' — player does not own that character.",
+			player.Name, self._characterId
+			))
+		return
+	end
+
+	local age = workspace:GetServerTimeNow() - intent.Timestamp
 	if age > STALE_INTENT_THRESHOLD_S then
 		warn(string.format(
 			"[ReplicationBridge] Discarding stale intent '%s' from %s (age %.2fs)",
@@ -219,6 +295,15 @@ function ReplicationBridge:_HandleIncomingIntent(intent: AnimationIntent)
 	if self._destroyed then return end
 	if intent.CharacterId ~= self._characterId then return end
 
+	-- Bug T fix: the non-owning client never incremented _sequenceNumber when
+	-- successfully receiving a rebroadcast intent. The server increments its counter
+	-- on every accepted intent, so the non-owning client's counter immediately fell
+	-- behind and _HandleSnapshot saw a mismatch on virtually every snapshot, triggering
+	-- full reconciliation even when the client was perfectly in sync.
+	-- Fix: mirror the server's increment here so the counters stay in lockstep under
+	-- normal operation. Reconciliation then only triggers on genuine gaps (dropped intents).
+	self._sequenceNumber += 1
+
 	if self._onIntentReceived then
 		self._onIntentReceived(intent)
 	end
@@ -238,12 +323,20 @@ function ReplicationBridge:_HandleSnapshot(snapshot: SnapshotData)
 	if self._destroyed then return end
 	if snapshot.CharacterId ~= self._characterId then return end
 
-	if snapshot.SequenceNumber ~= self._sequenceNumber then
+	-- Fix: always sync the local counter to the server's value regardless of whether
+	-- they match. Only intents increment the sequence number (both server-side on
+	-- receipt and client-side on relay). Snapshots do NOT increment it.
+	-- Non-owning clients mirror intent increments, so under normal operation their
+	-- counter stays in lockstep with the server's. A mismatch here means dropped
+	-- intents — genuine desync — and reconciliation is warranted.
+	local prevSeq = self._sequenceNumber
+	self._sequenceNumber = snapshot.SequenceNumber
+
+	if snapshot.SequenceNumber ~= prevSeq then
 		warn(string.format(
 			"[ReplicationBridge] Sequence mismatch for character %s: local=%d server=%d. Reconciling.",
-			self._characterId, self._sequenceNumber, snapshot.SequenceNumber
+			self._characterId, prevSeq, snapshot.SequenceNumber
 			))
-		self._sequenceNumber = snapshot.SequenceNumber
 		-- Bug #7 fix: this callback was always nil in the original because the
 		-- constructor never stored it. Now correctly fires AnimationController's
 		-- _OnSnapshotMismatch for desync recovery.

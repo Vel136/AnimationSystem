@@ -22,20 +22,27 @@ local ExclusiveGroupManager = {}
 ExclusiveGroupManager.__index = ExclusiveGroupManager
 
 export type ExclusiveGroupManager = typeof(setmetatable({} :: {
-	_groups         : { [string]: GroupRecord },
-	_pendingTimers  : { [string]: thread? }, -- per-group coroutine watching MinDuration expiry
-	_onPendingReady : ((groupName: string, wrapper: any) -> ())?,
-	_destroyed      : boolean,
+	_groups           : { [string]: GroupRecord },
+	_pendingTimers    : { [string]: thread? }, -- per-group coroutine watching MinDuration expiry
+	_onPendingReady   : ((groupName: string, wrapper: any) -> ())?,
+	_onPendingDestroy : ((wrapper: any) -> ())?,
+	_destroyed        : boolean,
 }, ExclusiveGroupManager))
 
 -- onPendingReady: callback issued when a deferred request becomes eligible to play.
--- AnimationController binds this to its own internal handler.
-function ExclusiveGroupManager.new(onPendingReady: ((string, any) -> ())?): ExclusiveGroupManager
+-- onPendingDestroy: callback issued when a pending wrapper is discarded without
+--   being promoted (e.g. on Destroy). Allows the caller to return it to its pool.
+--   If nil, wrappers are hard-destroyed.
+function ExclusiveGroupManager.new(
+	onPendingReady    : ((string, any) -> ())?,
+	onPendingDestroy  : ((any) -> ())?
+): ExclusiveGroupManager
 	return setmetatable({
-		_groups         = {},
-		_pendingTimers  = {},
-		_onPendingReady = onPendingReady,
-		_destroyed      = false,
+		_groups           = {},
+		_pendingTimers    = {},
+		_onPendingReady   = onPendingReady,
+		_onPendingDestroy = onPendingDestroy,
+		_destroyed        = false,
 	}, ExclusiveGroupManager)
 end
 
@@ -156,14 +163,24 @@ function ExclusiveGroupManager:OnActiveCompleted(groupName: string)
 	local record = self._groups[groupName]
 	if not record then return end
 
-	record.ActiveWrapper = nil
-
 	local pending = record.PendingWrapper
 	if pending then
+		-- Bug I fix: do NOT clear ActiveWrapper before promotion is confirmed.
+		-- If _onPendingReady fails early (e.g. the layer no longer exists), it
+		-- destroys the pending wrapper and returns without ever setting a new
+		-- ActiveWrapper. If we cleared ActiveWrapper here first, the group would
+		-- be permanently dead — slot nil, no pending, no recovery path.
+		-- Instead, leave ActiveWrapper in place until EvaluatePlayRequest commits
+		-- the new wrapper (it unconditionally sets record.ActiveWrapper = incomingWrapper
+		-- on an ALLOW verdict). On a failed promotion we also need to clear it, so
+		-- _onPendingReady is responsible for calling ClearActive on failure.
 		record.PendingWrapper = nil
 		if self._onPendingReady then
 			self._onPendingReady(groupName, pending)
 		end
+	else
+		-- No pending successor — safe to clear the slot immediately.
+		record.ActiveWrapper = nil
 	end
 end
 
@@ -191,10 +208,18 @@ function ExclusiveGroupManager:Destroy()
 		end
 	end
 
-	-- Destroy any pending wrappers that never got promoted.
+	-- Bug V fix: return pending wrappers to the controller's pool via _onPendingDestroy
+	-- rather than hard-destroying them. Hard-destroying permanently shrinks pool
+	-- capacity when Destroy is called from _OnSnapshotMismatch, which does not also
+	-- clear the pool. Over repeated reconciliations the pool drains to zero and every
+	-- grouped animation allocates a fresh wrapper instead of reusing a pooled one.
 	for _, record in self._groups do
 		if record.PendingWrapper then
-			record.PendingWrapper:_Destroy()
+			if self._onPendingDestroy then
+				self._onPendingDestroy(record.PendingWrapper)
+			else
+				record.PendingWrapper:_Destroy()
+			end
 			record.PendingWrapper = nil
 		end
 	end
@@ -227,7 +252,7 @@ function ExclusiveGroupManager:ValidateInvariants(): { string }
 			if record.ActiveWrapper == record.PendingWrapper then
 				table.insert(violations, string.format(
 					"Group '%s': ActiveWrapper and PendingWrapper are the same object", groupName
-					))
+				))
 			end
 		end
 	end

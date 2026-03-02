@@ -161,7 +161,7 @@ function DebugInspector:ValidateInvariants(): { Valid: boolean, Violations: { st
 			table.insert(violations, string.format(
 				"Group '%s' has %d wrappers with non-zero weight: %s",
 				group, #entries, table.concat(names, ", ")
-				))
+			))
 		end
 	end
 
@@ -171,7 +171,7 @@ function DebugInspector:ValidateInvariants(): { Valid: boolean, Violations: { st
 			table.insert(violations, string.format(
 				"Wrapper '%s' EffectiveWeight %.4f is outside [0, 1]",
 				wrapper.Config.Name, wrapper.EffectiveWeight
-				))
+			))
 		end
 	end
 
@@ -197,7 +197,7 @@ function DebugInspector:ValidateInvariants(): { Valid: boolean, Violations: { st
 				table.insert(violations, string.format(
 					"Pooled wrapper for config '%s' has IsPlaying = true",
 					wrapper.Config and wrapper.Config.Name or "unknown"
-					))
+				))
 			end
 		end
 	end

@@ -203,7 +203,7 @@ function LayerManager:ValidateInvariants(activeWrappers: { [string]: any }?): { 
 				"Layer order violation: '%s' (Order %d) not strictly greater than '%s' (Order %d)",
 				self._layers[i].Name, self._layers[i].Order,
 				self._layers[i - 1].Name, self._layers[i - 1].Order
-				))
+			))
 		end
 	end
 
@@ -225,7 +225,7 @@ function LayerManager:ValidateInvariants(activeWrappers: { [string]: any }?): { 
 						"Layer '%s' ActiveTracks contains a wrapper ('%s') not in AnimationController.ActiveWrappers — possible leak",
 						layer.Name,
 						trackWrapper.Config and trackWrapper.Config.Name or "unknown"
-						))
+					))
 				end
 			end
 		end
@@ -234,4 +234,5 @@ function LayerManager:ValidateInvariants(activeWrappers: { [string]: any }?): { 
 	return violations
 end
 
+return LayerManager
 return LayerManager
