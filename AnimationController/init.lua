@@ -109,6 +109,9 @@ function AnimationController.new(cfg: ControllerConfig): any
 		cfg.IsOwningClient,
 		function(intent: Types.AnimationIntent)
 			self:_OnIntentReceived(intent)
+		end,
+		function(snapshot: any)                
+			self:_OnSnapshotMismatch(snapshot)
 		end
 	)
 
@@ -182,6 +185,7 @@ function AnimationController:_RetireWrapper(configName: string)
 	local pool = self._wrapperPool[configName]
 
 	if #pool < MAX_POOL_SIZE_PER_CONFIG and wrapper:_IsPoolReady() then
+		wrapper.CompletedSignal:DisconnectAll()
 		table.insert(pool, wrapper)
 	else
 		wrapper:_Destroy()
@@ -241,7 +245,15 @@ function AnimationController:Stop(animationName: string, immediate: boolean?)
 	if not wrapper then return end
 	wrapper:_Stop(immediate == true)
 	if wrapper.Config.Group then
-		self.GroupManager:ClearActive(wrapper.Config.Group)
+		if immediate == true or not wrapper.IsFading then
+			self.GroupManager:ClearActive(wrapper.Config.Group)
+		else
+			-- Defer the clear until the fade finishes (weight hits 0 in _PushWeights → _RetireWrapper)
+			local group = wrapper.Config.Group
+			wrapper.CompletedSignal:Once(function()
+				self.GroupManager:ClearActive(group)
+			end)
+		end
 	end
 	if not IS_SERVER and self._replication._isOwningClient then
 		self._replication:QueueIntent(animationName, "STOP", self.StateMachine:GetCurrentStateName())
@@ -323,11 +335,12 @@ function AnimationController:_ExecutePlayRequest(configName: string)
 
 	local verdict: Types.ConflictVerdict
 	if incumbentWrapper then
+		local incumbentLayer = self.LayerManager:GetLayer(incumbentWrapper.Config.Layer)
 		verdict = ConflictResolver.ResolveNoGroup(
 			config,
 			layerRecord.Order,
 			incumbentWrapper.Config,
-			layerRecord.Order,
+			incumbentLayer and incumbentLayer.Order or 0,   
 			incumbentWrapper.StartTimestamp
 		)
 	else
@@ -367,6 +380,13 @@ end
 
 function AnimationController:_OnPendingReady(groupName: string, wrapper: any)
 	if self.IsDestroyed then return end
+	
+	local record = self.GroupManager._groups[groupName]
+	if not record or record.PendingWrapper ~= wrapper then
+		wrapper:_Destroy()
+		return
+	end
+	
 	local config      = wrapper.Config
 	local layerRecord = self.LayerManager:GetLayer(config.Layer)
 	if not layerRecord then return end
@@ -449,6 +469,34 @@ function AnimationController:_OnIntentReceived(intent: Types.AnimationIntent)
 	end
 end
 
+function AnimationController:_OnSnapshotMismatch(snapshot: any)
+	if self.IsDestroyed then return end
+
+	-- Stop everything currently playing so we start from a clean slate.
+	-- Use immediate = true to avoid stale fades polluting the reconciled state.
+	for name, wrapper in self.ActiveWrappers do
+		wrapper:_Stop(true)
+		if wrapper.Config.Group then
+			self.GroupManager:ClearActive(wrapper.Config.Group)
+		end
+	end
+	table.clear(self.ActiveWrappers)
+
+	-- Reconcile state machine if it diverged.
+	if snapshot.StateName and snapshot.StateName ~= self.StateMachine:GetCurrentStateName() then
+		self.StateMachine:RequestTransition(snapshot.StateName, math.huge)
+	end
+
+	-- Replay the server-authoritative group animations.
+	-- Non-group animations are not tracked in snapshots — they're considered
+	-- ephemeral and will naturally resume via the state machine on next tick.
+	if snapshot.ActiveGroupAnims then
+		for _group, animName in snapshot.ActiveGroupAnims do
+			self:Play(animName)
+		end
+	end
+end
+
 -- ── State Machine Public Interface ────────────────────────────────────────
 
 function AnimationController:RequestStateTransition(stateName: string, priority: number)
@@ -460,7 +508,7 @@ end
 function AnimationController:_BuildActiveGroupAnimMap(): { [string]: string }
 	local map = {}
 	for _, wrapper in self.ActiveWrappers do
-		if wrapper.Config.Group and wrapper.IsPlaying then
+		if wrapper.Config.Group and wrapper.IsPlaying and not wrapper.IsFading then
 			map[wrapper.Config.Group] = wrapper.Config.Name
 		end
 	end

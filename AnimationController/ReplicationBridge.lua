@@ -60,6 +60,7 @@ export type ReplicationBridge = typeof(setmetatable({} :: {
 	_sequenceNumber  : number,
 	_snapshotTimer   : number,
 	_connections     : { RBXScriptConnection },
+	_onSnapshotMismatch : ((snapshot: SnapshotData) -> ())?,
 	_destroyed       : boolean,
 	_onIntentReceived : ((AnimationIntent) -> ())?,
 }, ReplicationBridge))
@@ -71,7 +72,8 @@ function ReplicationBridge.new(
 	intentRemote     : RemoteEvent?,
 	snapshotRemote   : RemoteEvent?,
 	isOwningClient   : boolean,
-	onIntentReceived : ((AnimationIntent) -> ())?
+	onIntentReceived : ((AnimationIntent) -> ())?,
+	onSnapshotMismatch : ((any) -> ())?
 ): ReplicationBridge
 
 	local isServer = RunService:IsServer()
@@ -262,14 +264,16 @@ function ReplicationBridge:_HandleSnapshot(snapshot: SnapshotData)
 
 	if snapshot.SequenceNumber ~= self._sequenceNumber then
 		warn(string.format(
-			"[ReplicationBridge] Sequence mismatch for character %s: local=%d server=%d. Reconciliation needed.",
+			"[ReplicationBridge] Sequence mismatch for character %s: local=%d server=%d. Reconciling.",
 			self._characterId, self._sequenceNumber, snapshot.SequenceNumber
 			))
 		self._sequenceNumber = snapshot.SequenceNumber
-		-- Reconciliation: AnimationController registers a handler separately
-		-- to force-sync state when this mismatch is detected.
+		if self._onSnapshotMismatch then
+			self._onSnapshotMismatch(snapshot)
+		end
 	end
 end
+
 
 -- ── Sequence Management ────────────────────────────────────────────────────
 

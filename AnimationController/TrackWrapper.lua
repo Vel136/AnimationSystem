@@ -126,7 +126,10 @@ function TrackWrapper:_Stop(immediate: boolean)
 	self.IsPlaying    = false
 	self.IsFading     = (not immediate) and self.Config.FadeOutTime > 0
 	self.TargetWeight = 0
-
+	
+	if immediate then
+		self.EffectiveWeight = 0  
+	end
 	-- Only interact with the real track on the client.
 	if IS_SERVER or not self._track then return end
 
