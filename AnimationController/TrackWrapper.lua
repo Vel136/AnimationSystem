@@ -40,7 +40,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
-local Signal     = require(script.Parent.sign)
+local Signal     = require(script.Parent.Signal)
 local Types      = require(script.Parent.Types)
 
 type AnimationConfig = Types.AnimationConfig
